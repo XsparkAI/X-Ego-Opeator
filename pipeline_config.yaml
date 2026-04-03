@@ -1,0 +1,64 @@
+# Ego-X 算子流水线配置文件
+# ======================================
+#
+# 使用方法：
+#   python pipeline.py --config pipeline_config.yaml
+#   python pipeline.py --episode path/to/episode
+#
+# 数据集目录（Episode）必须包含名为 rgb.mp4 的输入视频文件。
+
+# ── 数据集源（Episode）配置 ───────────────────────────────────────────
+# 选项 1：明确指定数据集目录列表（支持单个路径或列表）
+episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic/episode2"
+
+# 选项 2：自动扫描根目录下的所有数据集目录
+# （包含 rgb.mp4 文件的子目录将被视为一个独立的数据集）
+# episode_root: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic"
+
+# ── 执行模式 ────────────────────────────────────────────────────────
+# parallel: true  — 无依赖关系的算子将并发执行
+# parallel: false — 所有算子按顺序依次执行
+parallel: true
+
+# "continue"   — 即使某个算子失败，仍继续执行后续所有算子
+# "fail_fast"  — 遇到首个算子失败时立即终止整个流水线
+on_error: continue
+
+# ── 算子配置 ────────────────────────────────────────────────────────
+# 算子执行顺序固定如下：
+#   1. video_quality      — 评估原始视频质量
+#   2. hand_detection     — 视频中的手部检测
+#   3. privacy_blur       — 模糊人脸与车牌（隐私保护）
+#   4. transcode          — 视频格式转码
+#   5. video_segmentation — 基于视觉大模型（VLM）将视频分割为任务步骤
+#
+# 将 enabled 设为 false 可跳过对应算子。
+# 若完全省略某个算子配置块，则使用默认值（即 enabled: true）。
+
+operators:
+  video_quality:
+    enabled: false
+    sample_fps: 2.0          # 抽帧频率（帧/秒）。设为 null 则处理所有帧
+
+  hand_detection:
+    enabled: false
+    conf_thresh: 0.3         # YOLO 检测置信度阈值
+    frame_step: 1            # 步长：每隔 N 帧处理一次（1 表示逐帧处理）
+    input_height: 720        # 检测前的图像缩放高度
+
+  privacy_blur:
+    enabled: true
+    face_thresh: 0.4      # 覆盖默认的人脸检测阈值
+    lp_thresh: 0.15        # 覆盖默认的车牌检测阈值
+
+  transcode:
+    enabled: false           # 默认关闭
+    # codec: h264            # 目标编码格式 (h264|h265|ffv1|prores|vp9|av1|copy)
+    # container: mp4         # 目标封装格式 (mp4|mkv|mov|avi|webm|mxf)
+    # resolution: 1920x1080  # 目标分辨率
+    # bitrate: 50M           # 目标码率（设置后启用有损压缩模式）
+    # fps: 30.0              # 目标帧率
+    # output_suffix: _transcoded  # 输出文件名后缀
+
+  video_segmentation:
+    enabled: false           # 默认关闭（运行需配置 DASHSCOPE_API_KEY 环境变量）

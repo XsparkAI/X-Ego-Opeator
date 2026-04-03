@@ -1,0 +1,5 @@
+test_video
+**/__pycache__
+tmp/
+*.zip
+**/weights
