@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -27,22 +28,23 @@ from typing import Any
 
 import yaml
 
-# Ensure project root is importable
+# Make in-repo operator packages importable when running ``python pipeline.py`` directly.
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from operators.operator_base import Operator, OperatorResult  # noqa: E402
+from operators.video_path import episode_has_input_video  # noqa: E402
+from operators.vlm_limit import get_cpu_global_limit, set_cpu_global_limit, set_vlm_global_limit  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
 )
 log = logging.getLogger(__name__)
 
-# ── Operator registry ──────────────────────────────────────────────
-
-# Maps operator name → (module_path, class_name, config_class_name)
+# Maps operator name -> (module_path, class_name, config_class_name).
 OPERATOR_REGISTRY: dict[str, tuple[str, str, str]] = {
+    "frame_cache":        ("operators.frame_cache.op_impl",      "FrameCacheOperator",    "FrameCacheConfig"),
     "video_segmentation": ("operators.caption.op_impl",         "SegmentationOperator",   "SegmentationConfig"),
     "segment_cut":        ("operators.segment_cut.op_impl",     "SegmentCutOperator",     "SegmentCutConfig"),
     "video_quality":      ("operators.video_quality.op_impl",   "VideoQualityOperator",   "VideoQualityConfig"),
@@ -52,6 +54,7 @@ OPERATOR_REGISTRY: dict[str, tuple[str, str, str]] = {
 }
 
 DEFAULT_ORDER = [
+    "frame_cache",          # 0. 预抽取稀疏帧缓存（供 caption/VLM hand 复用）
     "video_segmentation",   # 1. VLM 分段标注（输出 caption_v2t.json）
     "segment_cut",          # 2. 按标注裁剪短视频（fan-out 到 segments/ 子目录）
     "video_quality",        # 3. 视频质量检测（在短片段上运行）
@@ -61,17 +64,15 @@ DEFAULT_ORDER = [
 ]
 
 # Dependency graph: operator → set of operators it must wait for.
-# Operators not listed here (or with empty sets) have no dependencies.
+# Dependencies are evaluated only among enabled operators.
 DEPENDENCIES: dict[str, set[str]] = {
-    "segment_cut":    {"video_segmentation"},  # needs caption_v2t.json
-    "video_quality":  {"segment_cut"},         # runs on segment clips when available
-    "hand_analysis":  {"segment_cut"},         # runs on segment clips when available
-    "privacy_blur":   {"segment_cut"},         # runs on segment clips when available
-    "transcode":      {"privacy_blur"},        # prefers rgb_blurred.mp4
+    "video_segmentation": {"frame_cache"},
+    "segment_cut": {"video_segmentation"},   # reads caption_v2t.json
+    "video_quality": {"frame_cache"},        # can reuse cached quality frames
+    "hand_analysis": {"frame_cache"},        # both backends can start from the original video
+    "privacy_blur": set(),                    # runs on the current work directory directly
+    "transcode": {"privacy_blur"},           # prefers rgb_blurred.mp4 when available
 }
-# NOTE: When segment_cut is disabled, _build_stages() ignores these
-# dependencies (intersects with enabled_names), so quality/hand/blur
-# run immediately — backward compatible.
 
 
 def _import_operator(name: str, config_kwargs: dict[str, Any]) -> Operator:
@@ -99,10 +100,14 @@ class Pipeline:
         self.on_error: str = config.get("on_error", "continue")
         self.parallel: bool = config.get("parallel", True)
 
-        # Propagate API key from config to env (env var takes precedence)
+        # Allow YAML config to supply the API key without overriding an existing env var.
         api_key = config.get("dashscope_api_key", "")
         if api_key and not os.environ.get("DASHSCOPE_API_KEY"):
             os.environ["DASHSCOPE_API_KEY"] = api_key
+        input_video_path = str(config.get("input_video_path", "rgb.mp4")).strip() or "rgb.mp4"
+        os.environ["EGOX_INPUT_VIDEO_PATH"] = input_video_path
+        set_cpu_global_limit(config.get("cpu_global_max_concurrency", 2))
+        set_vlm_global_limit(config.get("vlm_global_max_concurrency", 1))
 
         self.operators: list[Operator] = self._build_operators()
 
@@ -110,14 +115,22 @@ class Pipeline:
         """Instantiate enabled operators in default order."""
         op_configs = self.config.get("operators", {})
         operators: list[Operator] = []
+        segmentation_enabled = op_configs.get("video_segmentation", {}).get("enabled", True)
 
         for name in DEFAULT_ORDER:
             oc = op_configs.get(name, {})
             if not oc.get("enabled", True):
                 log.info(f"  [{name}] disabled — skipping")
                 continue
-            # Separate 'enabled' from operator-specific kwargs
+            if name == "segment_cut" and not segmentation_enabled:
+                log.info("  [segment_cut] skipped because video_segmentation is disabled")
+                continue
+            # ``enabled`` controls pipeline selection only; the dataclass config should not receive it.
             config_kwargs = {k: v for k, v in oc.items() if k != "enabled"}
+            if name == "frame_cache":
+                config_kwargs = self._build_frame_cache_config(op_configs, config_kwargs)
+            elif name == "hand_analysis":
+                config_kwargs = self._build_hand_analysis_config(config_kwargs)
             try:
                 op = _import_operator(name, config_kwargs)
                 operators.append(op)
@@ -129,12 +142,62 @@ class Pipeline:
 
         return operators
 
-    def _build_stages(self) -> list[list[Operator]]:
-        """Group operators into parallel stages based on dependencies.
+    def _build_frame_cache_config(
+        self,
+        op_configs: dict[str, Any],
+        config_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        seg_cfg = op_configs.get("video_segmentation", {})
+        hand_cfg = op_configs.get("hand_analysis", {})
 
-        Returns a list of stages; operators within a stage can run in
-        parallel, stages execute sequentially.
-        """
+        config_kwargs.setdefault("include_caption", seg_cfg.get("enabled", True))
+        config_kwargs.setdefault("caption_window_sec", seg_cfg.get("window_sec", 10.0))
+        config_kwargs.setdefault("caption_step_sec", seg_cfg.get("step_sec", 5.0))
+        config_kwargs.setdefault("caption_frames_per_window", seg_cfg.get("frames_per_window", 12))
+        config_kwargs.setdefault(
+            "include_hand_vlm",
+            hand_cfg.get("enabled", True)
+            and hand_cfg.get("method", "yolo").lower() == "vlm",
+        )
+        config_kwargs.setdefault(
+            "hand_frame_step",
+            self.config.get("hand_vlm_sample_frame_step", hand_cfg.get("frame_step", 120)),
+        )
+        quality_cfg = op_configs.get("video_quality", {})
+        config_kwargs.setdefault(
+            "include_video_quality",
+            quality_cfg.get("enabled", True)
+            and quality_cfg.get("sample_fps") is not None,
+        )
+        config_kwargs.setdefault("quality_sample_fps", quality_cfg.get("sample_fps"))
+        return config_kwargs
+
+    def _build_hand_analysis_config(self, config_kwargs: dict[str, Any]) -> dict[str, Any]:
+        config_kwargs = dict(config_kwargs)
+        legacy_frame_step = config_kwargs.pop("frame_step", None)
+        method = str(config_kwargs.get("method", "yolo")).lower()
+
+        if method == "vlm":
+            config_kwargs["vlm_sample_frame_step"] = self.config.get(
+                "hand_vlm_sample_frame_step",
+                legacy_frame_step if legacy_frame_step is not None else 120,
+            )
+        else:
+            config_kwargs.setdefault(
+                "yolo_frame_step",
+                legacy_frame_step if legacy_frame_step is not None else 1,
+            )
+        return config_kwargs
+
+    @staticmethod
+    def _cleanup_episode_cache(episode_dir: Path) -> None:
+        cache_dir = episode_dir / ".frame_cache"
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            log.info(f"  cleaned frame cache: {cache_dir}")
+
+    def _build_stages(self) -> list[list[Operator]]:
+        """Group enabled operators into dependency-safe parallel stages."""
         enabled_names = {op.name for op in self.operators}
         op_by_name = {op.name: op for op in self.operators}
         placed: set[str] = set()
@@ -142,14 +205,14 @@ class Pipeline:
 
         remaining = list(self.operators)
         while remaining:
-            # Operators whose dependencies are all satisfied
+            # Operators in the same stage can run together once all enabled prerequisites are placed.
             ready = [
                 op for op in remaining
                 if DEPENDENCIES.get(op.name, set()).intersection(enabled_names)
                 .issubset(placed)
             ]
             if not ready:
-                # Safety: break circular deps by forcing next operator
+                # Defensive fallback for malformed dependency graphs.
                 ready = [remaining[0]]
             stages.append(ready)
             for op in ready:
@@ -170,8 +233,32 @@ class Pipeline:
 
         if result.status == "ok":
             log.info(f"  ✓ {op.name} completed ({elapsed:.1f}s)")
+        elif result.status == "pending":
+            log.info(f"  … {op.name} submitted batch work ({elapsed:.1f}s)")
         else:
             log.error(f"  ✗ {op.name} failed: {result.errors}")
+        return result
+
+    def _collect_pending(
+        self,
+        op: Operator,
+        work_dir: Path,
+    ) -> OperatorResult:
+        if not hasattr(op, "collect"):
+            return OperatorResult(
+                status="error",
+                operator=op.name,
+                errors=[f"{op.name} returned pending but does not implement collect()"],
+            )
+        log.info(f"⏳ waiting for pending {op.name} on {work_dir.name}")
+        t0 = time.time()
+        result = op.collect(work_dir)
+        elapsed = time.time() - t0
+        result.metrics["_elapsed_sec"] = round(elapsed, 2)
+        if result.status == "ok":
+            log.info(f"  ✓ {op.name} collected ({elapsed:.1f}s)")
+        else:
+            log.error(f"  ✗ {op.name} collect failed: {result.errors}")
         return result
 
     def _run_stage(
@@ -211,38 +298,67 @@ class Pipeline:
         all_results: list[OperatorResult] = []
         stages = self._build_stages()
         failed = False
+        op_by_name = {op.name: op for op in self.operators}
+        pending_ops: dict[tuple[Path, str], OperatorResult] = {}
 
-        # Active working directories — starts as just the episode.
-        # After segment_cut, this expands to segment sub-directories.
+        # Starts at the episode root; segment_cut can fan this out into per-segment work dirs.
         active_dirs: list[Path] = [episode_dir]
 
-        for stage in stages:
-            if failed and self.on_error == "fail_fast":
-                break
-
-            stage_results: list[OperatorResult] = []
-            for work_dir in active_dirs:
-                results = self._run_stage(stage, work_dir)
-                stage_results.extend(results)
-                if any(r.status == "error" for r in results):
-                    failed = True
-                    if self.on_error == "fail_fast":
-                        log.error("  Pipeline stopped (on_error=fail_fast)")
-                        break
-
-            all_results.extend(stage_results)
-
-            # Check for fan-out signal from segment_cut
-            for r in stage_results:
-                seg_dirs = r.metrics.get("segment_dirs")
-                if seg_dirs:
-                    active_dirs = [Path(d) for d in seg_dirs]
-                    log.info(
-                        f"  ⤷ fan-out: {len(active_dirs)} segment directories"
-                    )
+        try:
+            for stage in stages:
+                if failed and self.on_error == "fail_fast":
                     break
 
-        return all_results
+                stage_results: list[OperatorResult] = []
+                for work_dir in active_dirs:
+                    required_pending = {
+                        dep_name
+                        for op in stage
+                        for dep_name in DEPENDENCIES.get(op.name, set())
+                        if (work_dir, dep_name) in pending_ops
+                    }
+                    for dep_name in sorted(required_pending):
+                        collect_result = self._collect_pending(op_by_name[dep_name], work_dir)
+                        pending_ops.pop((work_dir, dep_name), None)
+                        stage_results.append(collect_result)
+                        all_results.append(collect_result)
+                        if collect_result.status == "error":
+                            failed = True
+                            if self.on_error == "fail_fast":
+                                log.error("  Pipeline stopped (on_error=fail_fast)")
+                                break
+                    if failed and self.on_error == "fail_fast":
+                        break
+
+                    results = self._run_stage(stage, work_dir)
+                    for result in results:
+                        if result.status == "pending":
+                            pending_ops[(work_dir, result.operator)] = result
+                        else:
+                            stage_results.append(result)
+                            all_results.append(result)
+                    if any(r.status == "error" for r in results):
+                        failed = True
+                        if self.on_error == "fail_fast":
+                            log.error("  Pipeline stopped (on_error=fail_fast)")
+                            break
+
+                # segment_cut can switch downstream work from the episode root to segment dirs.
+                for r in stage_results:
+                    seg_dirs = r.metrics.get("segment_dirs")
+                    if seg_dirs:
+                        active_dirs = [Path(d) for d in seg_dirs]
+                        log.info(
+                            f"  ⤷ fan-out: {len(active_dirs)} segment directories"
+                        )
+                        break
+            for work_dir, op_name in list(pending_ops):
+                collect_result = self._collect_pending(op_by_name[op_name], work_dir)
+                pending_ops.pop((work_dir, op_name), None)
+                all_results.append(collect_result)
+            return all_results
+        finally:
+            self._cleanup_episode_cache(episode_dir)
 
     def run_all(self, episode_dirs: list[Path]) -> dict[str, Any]:
         """Run pipeline on multiple episodes, return summary report."""
@@ -256,19 +372,15 @@ class Pipeline:
             all_results[ep_dir.name] = [asdict(r) for r in results]
 
         total_elapsed = time.time() - total_t0
+        for ep_dir in episode_dirs:
+            self._cleanup_episode_cache(ep_dir)
         return _build_summary(episode_dirs, all_results, total_elapsed)
 
     def _build_pipeline_stages(self) -> list[list[Operator]]:
-        """Build stages for pipeline/streaming mode.
+        """Build dependency-safe stages for multi-episode streaming execution.
 
-        Unlike ``_build_stages()`` which groups independent operators into
-        a single parallel stage, this method creates one stage per operator
-        (in dependency-safe order) so that different episodes can overlap
-        at the operator level:
-
-            Episode 1: [quality] → [hand] → [blur]
-            Episode 2:    [quality] → [hand] → [blur]
-            Episode 3:       [quality] → [hand] → [blur]
+        Each stage may contain multiple independent operators for one work item,
+        while different episodes can overlap across stages.
         """
         enabled_names = {op.name for op in self.operators}
         placed: set[str] = set()
@@ -276,7 +388,7 @@ class Pipeline:
 
         remaining = list(self.operators)
         while remaining:
-            # Pick operators whose dependencies are satisfied
+            # Keep operators with the same ready set in the same stage.
             ready = [
                 op for op in remaining
                 if DEPENDENCIES.get(op.name, set()).intersection(enabled_names)
@@ -284,9 +396,8 @@ class Pipeline:
             ]
             if not ready:
                 ready = [remaining[0]]
-            # In pipeline mode, emit each ready operator as its own stage
+            stages.append(ready)
             for op in ready:
-                stages.append([op])
                 placed.add(op.name)
                 remaining.remove(op)
 
@@ -299,30 +410,23 @@ class Pipeline:
         episode_dirs: list[Path],
         stage_workers: list[int] | None = None,
     ) -> dict[str, Any]:
-        """Run pipeline on multiple episodes in streaming/pipeline mode.
+        """Run multiple episodes in stage-streaming mode.
 
-        Instead of completing all operators for episode N before starting
-        episode N+1, each operator gets its own worker pool and episodes
-        flow through operators like an assembly line:
-
-            Episode 1 → [quality] → [hand] → [blur] → done
-            Episode 2 →    [quality] → [hand] → [blur] → done
-            Episode 3 →       [quality] → [hand] → [blur] → done
-
-        This overlaps I/O-bound and GPU-bound operators across episodes.
+        A later episode can enter an earlier stage before the previous episode
+        has finished the whole pipeline, which improves throughput for batch runs.
 
         Args:
             episode_dirs: Directories to process.
             stage_workers: Number of worker threads per stage.
-                If None, defaults to 1 worker per stage.
+                If None, defaults to cpu_global_max_concurrency per stage.
         """
         stages = self._build_pipeline_stages()
         n_stages = len(stages)
 
         if stage_workers is None:
-            stage_workers = [1] * n_stages
+            stage_workers = [get_cpu_global_limit()] * n_stages
         elif len(stage_workers) < n_stages:
-            # Pad with 1s if user provided fewer values than stages
+            # Preserve explicit overrides and fall back to one worker for missing entries.
             stage_workers = list(stage_workers) + [1] * (n_stages - len(stage_workers))
 
         log.info(
@@ -333,11 +437,48 @@ class Pipeline:
             names = [op.name for op in stage]
             log.info(f"  Stage {i}: {', '.join(names)} (×{stage_workers[i]} workers)")
 
-        # Per-episode results accumulator
+        # Episode results are collected under the current work-dir name.
         _SENTINEL = object()
         lock = threading.Lock()
         all_results: dict[str, list[dict]] = {}  # ep_name → list of result dicts
         completed_count = 0
+        op_by_name = {op.name: op for op in self.operators}
+        pending_ops: dict[tuple[str, str], OperatorResult] = {}
+
+        def _pending_key(work_dir: Path, op_name: str) -> tuple[str, str]:
+            return (str(work_dir.resolve()), op_name)
+
+        def _collect_required_pending(stage_ops: list[Operator], work_dir: Path) -> list[OperatorResult]:
+            required = {
+                dep_name
+                for op in stage_ops
+                for dep_name in DEPENDENCIES.get(op.name, set())
+                if _pending_key(work_dir, dep_name) in pending_ops
+            }
+            collected: list[OperatorResult] = []
+            for dep_name in sorted(required):
+                result = self._collect_pending(op_by_name[dep_name], work_dir)
+                pending_ops.pop(_pending_key(work_dir, dep_name), None)
+                with lock:
+                    all_results.setdefault(work_dir.name, []).append(asdict(result))
+                collected.append(result)
+            return collected
+
+        def _collect_all_pending(work_dir: Path) -> list[OperatorResult]:
+            pending_names = [
+                op_name
+                for key, _result in list(pending_ops.items())
+                if key[0] == str(work_dir.resolve())
+                for op_name in [key[1]]
+            ]
+            collected: list[OperatorResult] = []
+            for op_name in sorted(set(pending_names)):
+                result = self._collect_pending(op_by_name[op_name], work_dir)
+                pending_ops.pop(_pending_key(work_dir, op_name), None)
+                with lock:
+                    all_results.setdefault(work_dir.name, []).append(asdict(result))
+                collected.append(result)
+            return collected
 
         def _run_stage_ops(
             stage_ops: list[Operator], work_dir: Path,
@@ -358,7 +499,10 @@ class Pipeline:
 
             with lock:
                 for r in results:
-                    all_results.setdefault(work_dir.name, []).append(asdict(r))
+                    if r.status == "pending":
+                        pending_ops[_pending_key(work_dir, r.operator)] = r
+                    else:
+                        all_results.setdefault(work_dir.name, []).append(asdict(r))
             return results
 
         def _stage_worker_loop(
@@ -378,9 +522,16 @@ class Pipeline:
                     break
 
                 work_dir: Path = item
+                collected = _collect_required_pending(stage_ops, work_dir)
+                if any(r.status == "error" for r in collected):
+                    if out_q is None:
+                        with lock:
+                            completed_count += 1
+                    in_q.task_done()
+                    continue
                 results = _run_stage_ops(stage_ops, work_dir)
 
-                # Check for fan-out (segment_cut produces segment_dirs)
+                # segment_cut forwards per-segment work items instead of the episode root.
                 fan_out_dirs: list[str] | None = None
                 for r in results:
                     seg_dirs = r.metrics.get("segment_dirs")
@@ -390,13 +541,14 @@ class Pipeline:
 
                 if out_q is not None:
                     if fan_out_dirs:
-                        # Fan-out: push each segment dir to next stage
+                        # Fan-out: each segment becomes an independent downstream work item.
                         for d in fan_out_dirs:
                             out_q.put(Path(d))
                     else:
                         out_q.put(work_dir)
                 else:
-                    # Last stage — work unit fully done
+                    _collect_all_pending(work_dir)
+                    # Last stage owns final pending collection and completion accounting.
                     with lock:
                         completed_count += 1
                     log.info(
@@ -437,14 +589,12 @@ class Pipeline:
         for _ in range(stage_workers[0]):
             queues[0].put(_SENTINEL)
 
-        # Drain stages sequentially: wait for stage K workers to finish,
-        # then inject extra sentinels if stage K+1 has more workers.
+        # Drain stages in order and forward enough sentinels for downstream worker counts.
         for stage_idx in range(n_stages):
             for t in threads_by_stage[stage_idx]:
                 t.join()
 
-            # Stage K sent prev_workers sentinels to stage K+1.
-            # If stage K+1 has more workers, inject the delta.
+            # Upstream workers already forwarded one sentinel each; add only the missing delta.
             if stage_idx + 1 < n_stages:
                 sent = stage_workers[stage_idx]
                 needed = stage_workers[stage_idx + 1]
@@ -485,7 +635,7 @@ def _resolve_episodes(config: dict[str, Any]) -> list[Path]:
     """Resolve episode directories from config."""
     episodes: list[Path] = []
 
-    # Explicit list (accept string or list)
+    # Accept either a single path or a list of episode paths.
     raw = config.get("episodes", [])
     if isinstance(raw, str):
         raw = [raw]
@@ -498,7 +648,7 @@ def _resolve_episodes(config: dict[str, Any]) -> list[Path]:
         else:
             log.warning(f"Episode directory not found: {p}")
 
-    # Auto-discover under episode_root
+    # Optionally auto-discover episodes under a root directory.
     root = config.get("episode_root")
     if root:
         root_path = Path(root)
@@ -506,7 +656,7 @@ def _resolve_episodes(config: dict[str, Any]) -> list[Path]:
             root_path = PROJECT_ROOT / root_path
         if root_path.is_dir():
             for d in sorted(root_path.iterdir()):
-                if d.is_dir() and (d / "rgb.mp4").exists():
+                if d.is_dir() and episode_has_input_video(d):
                     episodes.append(d)
         else:
             log.warning(f"episode_root not found: {root_path}")
@@ -572,8 +722,8 @@ Examples:
     )
     parser.add_argument(
         "--stage-workers", type=str, default=None,
-        help="Pipeline mode: comma-separated workers per stage, e.g. '2,2,4'. "
-             "Defaults to 1 per stage.",
+        help="Advanced override: comma-separated workers per stage, e.g. '2,2,4'. "
+             "If omitted, each stage defaults to cpu_global_max_concurrency.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -589,7 +739,7 @@ Examples:
             parser.error(f"Config file not found: {args.config} (use --episode for single episode)")
         config = {}
 
-    # Build pipeline
+    # Instantiate enabled operators and dependency state.
     log.info("Building pipeline...")
     pipeline = Pipeline(config)
 
@@ -597,7 +747,7 @@ Examples:
         log.warning("No operators enabled — nothing to do.")
         return
 
-    # Resolve episodes
+    # Resolve input episodes from CLI or config.
     if args.episode:
         ep = args.episode if args.episode.is_absolute() else PROJECT_ROOT / args.episode
         episode_dirs = [ep]
@@ -608,19 +758,19 @@ Examples:
         log.warning("No episode directories found — check config.")
         return
 
-    # Resolve execution mode: CLI flag > config > default
+    # CLI flag wins over config for execution mode.
     exec_mode = args.mode or config.get("execution_mode", "sequential")
 
-    # Parse stage workers
+    # Parse optional per-stage worker overrides.
     stage_workers: list[int] | None = None
-    sw_raw = args.stage_workers or config.get("stage_workers")
+    sw_raw = args.stage_workers
     if sw_raw:
         if isinstance(sw_raw, str):
             stage_workers = [int(x) for x in sw_raw.split(",")]
         elif isinstance(sw_raw, list):
             stage_workers = [int(x) for x in sw_raw]
 
-    # Dry run
+    # Dry-run only prints the stage plan.
     if args.dry_run:
         if exec_mode == "pipeline":
             stages = pipeline._build_pipeline_stages()
@@ -635,8 +785,10 @@ Examples:
         for i, stage in enumerate(stages):
             names = [op.name for op in stage]
             mode = "parallel" if len(names) > 1 and pipeline.parallel else "sequential"
-            workers = (stage_workers[i] if stage_workers and i < len(stage_workers)
-                       else 1) if exec_mode == "pipeline" else "-"
+            workers = (
+                stage_workers[i] if stage_workers and i < len(stage_workers)
+                else get_cpu_global_limit()
+            ) if exec_mode == "pipeline" else "-"
             print(f"    Stage {i + 1} ({mode}): {', '.join(names)}"
                   f"  [workers={workers}]")
         print()
@@ -649,7 +801,7 @@ Examples:
         summary = pipeline.run_all(episode_dirs)
     _print_summary(summary)
 
-    # Save report
+    # Save report when requested.
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(
@@ -658,7 +810,7 @@ Examples:
         )
         log.info(f"Report saved to {args.report}")
 
-    # Exit code
+    # Surface operator failures as a non-zero process exit.
     if summary["operators_error"] > 0:
         sys.exit(1)
 

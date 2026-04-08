@@ -25,6 +25,11 @@ import cv2
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+try:
+    from ..video_path import resolve_episode_video_path
+except ImportError:
+    from video_path import resolve_episode_video_path
+
 import segment_v2t as _sv
 from segment_v2t import (
     API_KEY, MODEL, WINDOW_SEC, STEP_SEC, FRAMES_PER_WINDOW,
@@ -118,8 +123,8 @@ def main():
                    help="Filter by task type")
     p.add_argument("--episode", type=str, default=None,
                    help="Process single episode by name")
-    p.add_argument("--model", type=str, default="qwen-vl-max",
-                   help="Model name for batch (default: qwen-vl-max)")
+    p.add_argument("--model", type=str, default="qwen3.5-plus",
+                   help="Model name for batch (default: qwen3.5-plus)")
     p.add_argument("--data-root", type=str, default=None,
                    help=f"Data directory (default: {DEFAULT_DATA_ROOT})")
     p.add_argument("--dry-run", action="store_true",
@@ -160,7 +165,7 @@ def main():
     with open(jsonl_path, "w") as f:
         for ep_dir, sop in episodes:
             name = ep_dir.name
-            rgb_path = str(ep_dir / "rgb.mp4")
+            rgb_path = str(resolve_episode_video_path(ep_dir))
 
             cap = cv2.VideoCapture(rgb_path)
             nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -202,6 +207,7 @@ def main():
                     "body": {
                         "model": args.model,
                         "messages": [{"role": "user", "content": content}],
+                        
                     },
                 }
                 f.write(json.dumps(request, ensure_ascii=False) + "\n")

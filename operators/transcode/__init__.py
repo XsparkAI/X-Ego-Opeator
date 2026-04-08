@@ -1,1 +1,1 @@
-# Video transcoding operator — lossless format conversion
+"""Video transcoding operator package."""

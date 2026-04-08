@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Video segmentation via VLM sliding-window analysis.
+Single-task caption generation via VLM sliding-window analysis.
 
 Core algorithm:
   1. Split video into overlapping windows, sample N frames per window
   2. Send frames to VLM → detect transitions per window
   3. Cluster transitions across windows using Hanning-weighted voting
-  4. Assemble segments with step labels
+  4. Assemble a unified caption with one task and multiple atomic actions
 
 Public API:
   from operators.caption.segment_v2t import segment
@@ -32,6 +32,37 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from ..vlm_limit import vlm_api_slot
+try:
+    from .vlm_api import (
+        build_multimodal_message,
+        collect_batch_chat_requests,
+        submit_batch_chat_requests,
+        submit_batch_chat_requests_async,
+        submit_direct_chat_requests,
+    )
+except ImportError:
+    from vlm_api import (
+        build_multimodal_message,
+        collect_batch_chat_requests,
+        submit_batch_chat_requests,
+        submit_batch_chat_requests_async,
+        submit_direct_chat_requests,
+    )
+try:
+    from .scene_classifier import (
+        classify_video_scene,
+        classify_video_scene_direct,
+        collect_scene_classification,
+        submit_scene_classification,
+    )
+except ImportError:
+    from scene_classifier import (
+        classify_video_scene,
+        classify_video_scene_direct,
+        collect_scene_classification,
+        submit_scene_classification,
+    )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -43,6 +74,8 @@ SCRIPT_DIR = Path(__file__).parent
 # ── VLM Config ───────────────────────────────────────────────────────────────
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 MODEL = "qwen3.5-plus"
+THINKING_BUDGET = 1024
+EXTRA_BODY = {"enable_thinking": True, "thinking_budget": THINKING_BUDGET}
 
 # ── Windowing Config ─────────────────────────────────────────────────────────
 WINDOW_SEC = 10.0          # Window duration in seconds
@@ -121,7 +154,12 @@ def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
 
 def save_frames_as_tmp_jpg(video_path: str, frame_ids: list[int], tmp_dir: str) -> list[str]:
     """Extract frames and save as temporary JPG files. Returns file paths."""
+    from ..frame_cache.cache_utils import get_cached_frame_paths
     from ..video_utils import get_manual_rotation, apply_rotation
+
+    cached = get_cached_frame_paths(Path(video_path).parent, frame_ids)
+    if cached:
+        return cached
 
     rotation = get_manual_rotation(video_path)
     cap = cv2.VideoCapture(video_path)
@@ -178,53 +216,86 @@ Note: len(instructions) should be len(transitions) + 1.
 If transitions is empty, instructions should have exactly 1 element describing the whole segment."""
 
 
-def vlm_analyze_window(video_path: str, window: Window, fps: float, task_name: str | None = None) -> dict | None:
-    """Send window frames to VLM, get transition analysis."""
-    from dashscope import MultiModalConversation
+def _parse_vlm_json(raw: str | None) -> dict | None:
+    if not raw:
+        return None
+    json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not json_match:
+        return None
+    try:
+        return json.loads(json_match.group())
+    except json.JSONDecodeError:
+        return None
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        frame_paths = save_frames_as_tmp_jpg(video_path, window.frame_ids, tmp_dir)
-        if not frame_paths:
-            return None
 
-        prompt = build_window_prompt(len(frame_paths), window, fps, task_name)
+def vlm_analyze_windows_batch(video_path: str, windows: list[Window], fps: float, task_name: str | None = None) -> list[dict | None]:
+    requests = build_window_requests(video_path, windows, fps, task_name)
+    if not requests:
+        return [None] * len(windows)
 
-        content = [{"image": f"file://{p}"} for p in frame_paths]
-        content.append({"text": prompt})
+    with vlm_api_slot():
+        responses = submit_batch_chat_requests(requests, model=MODEL, extra_body=EXTRA_BODY)
 
-        messages = [{"role": "user", "content": content}]
+    return parse_window_batch_responses(windows, requests, responses)
 
-        for attempt in range(3):
-            try:
-                response = MultiModalConversation.call(
-                    api_key=API_KEY, model=MODEL, messages=messages,
-                )
-                if response.status_code != 200:
-                    log.warning(f"  VLM API error (attempt {attempt+1}): {response.code} - {response.message}")
-                    continue
 
-                # Track tokens
-                if hasattr(response, "usage") and response.usage:
-                    _token_stats["calls"] += 1
-                    _token_stats["input_tokens"] += getattr(response.usage, "input_tokens", 0)
-                    _token_stats["output_tokens"] += getattr(response.usage, "output_tokens", 0)
+def vlm_analyze_windows_direct(
+    video_path: str,
+    windows: list[Window],
+    fps: float,
+    task_name: str | None = None,
+    max_workers: int = 8,
+) -> list[dict | None]:
+    requests = build_window_requests(video_path, windows, fps, task_name)
+    if not requests:
+        return [None] * len(windows)
 
-                raw = response.output.choices[0].message.content
-                if not isinstance(raw, str):
-                    raw = raw[0]["text"]
+    with vlm_api_slot():
+        responses = submit_direct_chat_requests(
+            requests,
+            model=MODEL,
+            extra_body=EXTRA_BODY,
+            max_workers=max_workers,
+        )
+    return parse_window_batch_responses(windows, requests, responses)
 
-                # Parse JSON
-                json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
-                    return result
-                else:
-                    log.warning(f"  Cannot parse JSON from VLM (attempt {attempt+1})")
 
-            except Exception as e:
-                log.warning(f"  VLM call failed (attempt {attempt+1}): {e}")
+def build_window_requests(
+    video_path: str,
+    windows: list[Window],
+    fps: float,
+    task_name: str | None = None,
+) -> list[dict]:
+    requests: list[dict] = []
+    for window in windows:
+        frames_b64 = extract_frames_b64(video_path, window.frame_ids)
+        if not frames_b64:
+            continue
+        prompt = build_window_prompt(len(frames_b64), window, fps, task_name)
+        requests.append(
+            {
+                "custom_id": f"win_{window.window_id}",
+                "model": MODEL,
+                "messages": build_multimodal_message(frames_b64, prompt),
+            }
+        )
+    return requests
 
-    return None
+
+def parse_window_batch_responses(
+    windows: list[Window],
+    requests: list[dict],
+    responses: dict[str, dict],
+) -> list[dict | None]:
+    by_id = {req["custom_id"]: _parse_vlm_json(responses.get(req["custom_id"], {}).get("text")) for req in requests}
+    return [by_id.get(f"win_{window.window_id}") for window in windows]
+
+
+def parse_window_results_map(
+    windows: list[Window],
+    responses: dict[str, dict],
+) -> list[dict | None]:
+    return [_parse_vlm_json(responses.get(f"win_{window.window_id}", {}).get("text")) for window in windows]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -368,8 +439,10 @@ def segment(
     window_sec: float = WINDOW_SEC,
     step_sec: float = STEP_SEC,
     frames_per_window: int = FRAMES_PER_WINDOW,
+    max_workers: int = 8,
+    batch_enabled: bool = True,
 ) -> dict:
-    """Segment a video into atomic actions. This is the public API.
+    """Generate a unified caption with one task and multiple atomic actions.
 
     Args:
         video_path: Path to the mp4 video file.
@@ -381,11 +454,8 @@ def segment(
 
     Returns:
         dict with keys:
-          - video: filename
-          - fps: video frame rate
-          - nframes: total frame count
-          - method: "v2t_windowing"
-          - atomic_action: list of {frame_interval: [start, end], instruction: str}
+          - scene: scene label
+          - tasks: a single task covering the whole video
     """
     video_path = Path(video_path).resolve()
     if not video_path.exists():
@@ -405,39 +475,150 @@ def segment(
     windows = build_windows(fps, nframes)
     log.info(f"[{name}] {len(windows)} windows (window={window_sec}s, step={step_sec}s, {frames_per_window} frames/win)")
 
-    # Analyze all windows with VLM in parallel
-    log.info(f"[{name}] Analyzing {len(windows)} windows in parallel...")
-    window_results = [None] * len(windows)
-
-    def _analyze(idx_win):
-        idx, w = idx_win
-        log.info(f"[{name}] Window {w.window_id}/{len(windows)-1} "
-                 f"[{w.start_frame}-{w.end_frame}] ({(w.end_frame-w.start_frame)/fps:.1f}s)")
-        result = vlm_analyze_window(str(video_path), w, fps, task_name)
-        if result:
-            log.info(f"[{name}] Window {w.window_id} → {len(result.get('transitions', []))} transitions")
+    mode_desc = "batch API" if batch_enabled else "direct API"
+    log.info(f"[{name}] Submitting scene + {len(windows)} windows via {mode_desc}...")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        if batch_enabled:
+            future_scene = pool.submit(classify_video_scene, video_path, fps=fps, nframes=nframes)
+            future_windows = pool.submit(vlm_analyze_windows_batch, str(video_path), windows, fps, task_name)
         else:
-            log.warning(f"[{name}] Window {w.window_id} → VLM returned no result")
-        return idx, result
-
-    with ThreadPoolExecutor(max_workers=min(8, len(windows))) as pool:
-        for idx, result in pool.map(_analyze, enumerate(windows)):
-            window_results[idx] = result
+            future_scene = pool.submit(classify_video_scene_direct, video_path, fps=fps, nframes=nframes)
+            future_windows = pool.submit(
+                vlm_analyze_windows_direct,
+                str(video_path),
+                windows,
+                fps,
+                task_name,
+                max_workers,
+            )
+        scene = future_scene.result()
+        window_results = future_windows.result()
+    log.info(f"[{name}] Scene: {scene}")
 
     # Build segments via cut clustering
     segments = build_segments_via_cuts(windows, window_results, fps, nframes, task_name)
+    task_caption = task_name or (segments[0]["instruction"] if segments else "perform the current task")
 
     return {
-        "video": video_path.name,
+        "scene": scene,
+        "tasks": [
+            {
+                "instruction": task_caption,
+                "frame_interval": [0, nframes],
+                "atomic_actions": [
+                    {
+                        "frame_interval": seg["frame_interval"],
+                        "caption": seg["instruction"],
+                    }
+                    for seg in segments
+                ],
+            }
+        ],
+    }
+
+
+def submit_segment_job(
+    video_path: str | Path,
+    *,
+    task_name: str | None = None,
+    window_sec: float = WINDOW_SEC,
+    step_sec: float = STEP_SEC,
+    frames_per_window: int = FRAMES_PER_WINDOW,
+) -> dict:
+    video_path = Path(video_path).resolve()
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found: {video_path}")
+
+    cap = cv2.VideoCapture(str(video_path))
+    nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
+
+    windows = build_windows(fps, nframes)
+    requests = build_window_requests(str(video_path), windows, fps, task_name)
+
+    log.info(f"[{video_path.stem}] Submitting scene + {len(windows)} windows via batch API...")
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_scene = pool.submit(submit_scene_classification, video_path, fps=fps, nframes=nframes)
+        future_windows = pool.submit(
+            lambda: (
+                {"batch_id": None, "request_count": 0}
+                if not requests
+                else submit_batch_chat_requests_async(requests, model=MODEL, extra_body=EXTRA_BODY)
+            )
+        )
+        scene_submission = future_scene.result()
+        windows_submission = future_windows.result()
+
+    return {
+        "method": "segment_v2t",
+        "video_path": str(video_path),
+        "task_name": task_name,
         "fps": fps,
         "nframes": nframes,
-        "method": "v2t_windowing",
-        "atomic_action": [
+        "windows": [
             {
-                "frame_interval": seg["frame_interval"],
-                "instruction": seg["instruction"],
+                "window_id": w.window_id,
+                "start_frame": w.start_frame,
+                "end_frame": w.end_frame,
+                "frame_ids": w.frame_ids,
             }
-            for seg in segments
+            for w in windows
+        ],
+        "scene_submission": scene_submission,
+        "windows_submission": windows_submission,
+    }
+
+
+def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
+    video_path = Path(state["video_path"])
+    fps = float(state["fps"])
+    nframes = int(state["nframes"])
+    task_name = state.get("task_name")
+    windows = [Window(**w) for w in state.get("windows", [])]
+
+    scene_submission = state.get("scene_submission")
+    windows_submission = state.get("windows_submission") or {}
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_scene = pool.submit(
+            collect_scene_classification,
+            scene_submission,
+            poll_interval_sec=poll_interval_sec,
+        )
+        future_windows = pool.submit(
+            lambda: {} if not windows_submission.get("batch_id") else collect_batch_chat_requests(
+                windows_submission["batch_id"],
+                poll_interval_sec=poll_interval_sec,
+                wait=True,
+            )
+        )
+        scene = future_scene.result()
+        windows_result = future_windows.result()
+
+    if windows_submission.get("batch_id") and windows_result.get("status") != "completed":
+        raise RuntimeError(f"Window batch ended with status: {windows_result.get('status')}")
+
+    window_results = parse_window_results_map(windows, windows_result.get("results", {})) if windows else []
+
+    segments = build_segments_via_cuts(windows, window_results, fps, nframes, task_name)
+    task_caption = task_name or (segments[0]["instruction"] if segments else "perform the current task")
+    log.info(f"[{video_path.stem}] Scene: {scene}")
+
+    return {
+        "scene": scene,
+        "tasks": [
+            {
+                "instruction": task_caption,
+                "frame_interval": [0, nframes],
+                "atomic_actions": [
+                    {
+                        "frame_interval": seg["frame_interval"],
+                        "caption": seg["instruction"],
+                    }
+                    for seg in segments
+                ],
+            }
         ],
     }
 
@@ -461,7 +642,9 @@ def process_video(video_path: Path, preview: bool = False, dry_run: bool = False
         return None
 
     caption = segment(video_path, task_name=task_name)
-    fps = caption["fps"]
+    cap = cv2.VideoCapture(str(video_path))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.release()
 
     # Save
     out_path = video_path.parent / f"caption_{OUTPUT_SUFFIX}.json"
@@ -471,11 +654,14 @@ def process_video(video_path: Path, preview: bool = False, dry_run: bool = False
     # Print summary
     print(f"\n{'─' * 60}")
     print(f"  {name}")
-    print(f"  Segments: {len(caption['atomic_action'])}")
-    for i, a in enumerate(caption["atomic_action"]):
+    print(f"  Scene: {caption.get('scene', 'unknown')}")
+    task = caption["tasks"][0]
+    print(f"  Task: {task['instruction']}")
+    print(f"  Segments: {len(task['atomic_actions'])}")
+    for i, a in enumerate(task["atomic_actions"]):
         s, e = a["frame_interval"]
         dur = (e - s) / fps
-        print(f"    Step {i + 1}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['instruction']}")
+        print(f"    Step {i + 1}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['caption']}")
     print(f"{'─' * 60}")
 
     # Preview
@@ -525,7 +711,8 @@ def generate_preview(video_path: Path, caption: dict, fps: float) -> Path:
 
     writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
 
-    actions = caption.get("atomic_action", [])
+    tasks = caption.get("tasks", [])
+    actions = tasks[0].get("atomic_actions", []) if tasks else []
 
     fidx = 0
     while True:
@@ -538,7 +725,7 @@ def generate_preview(video_path: Path, caption: dict, fps: float) -> Path:
             s, e = a["frame_interval"]
             if s <= fidx < e:
                 step_idx = actions.index(a) + 1
-                text = f"[Step {step_idx}] {a['instruction']}"
+                text = f"[Step {step_idx}] {a.get('caption', a.get('instruction', ''))}"
                 frame = _render_subtitle(frame, text)
                 break
         writer.write(frame)

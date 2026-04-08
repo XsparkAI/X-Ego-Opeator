@@ -1,15 +1,16 @@
-"""Adapter wrapping blur_video() into the Operator protocol."""
+"""Pipeline adapter for privacy blur inference and optional segment merge."""
 
 from __future__ import annotations
 
-import json
 import logging
 import subprocess
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
 from ..operator_base import OperatorResult
+from ..video_path import resolve_episode_video_path
 
 log = logging.getLogger(__name__)
 
@@ -24,28 +25,27 @@ def _concat_blurred_to_root(episode_root: Path) -> None:
     """Concatenate all seg_*/rgb_blurred.mp4 into episode_root/rgb_blurred.mp4.
 
     Uses ffmpeg concat demuxer (stream-copy, no re-encode).
-    Only runs when called from the last segment — determined by checking
-    whether all segment dirs already have rgb_blurred.mp4.
+    Only runs after every active segment already has its blurred output.
     """
     segments_dir = episode_root / "segments"
     if not segments_dir.exists():
         return
 
     seg_dirs = sorted(segments_dir.iterdir())
-    # Only consider segments that have a source rgb.mp4 (current run's segments)
+    # Only include segments produced in the current episode fan-out.
     active_seg_dirs = [d for d in seg_dirs if d.is_dir() and (d / "rgb.mp4").exists()]
     blurred_clips = [d / "rgb_blurred.mp4" for d in active_seg_dirs]
 
-    # Wait until all active segments have been processed
+    # Another segment invocation will retry until the full set is ready.
     if not all(p.exists() and p.stat().st_size > 1024 for p in blurred_clips):
-        return  # Not all done yet — another segment will trigger this later
+        return
 
     output_path = episode_root / "rgb_blurred.mp4"
     if output_path.exists():
-        return  # Already concatenated
+        return
 
     if len(blurred_clips) == 1:
-        # Single segment: just copy
+        # Single segment fan-out does not need concat.
         import shutil
         shutil.copy2(str(blurred_clips[0]), str(output_path))
         log.info(f"Copied single segment blurred video to {output_path}")
@@ -81,6 +81,7 @@ class PrivacyBlurConfig:
     scale: float = 1.0
     face_thresh: float | None = None
     lp_thresh: float | None = None
+    max_concurrency: int = 1
 
 
 class PrivacyBlurOperator:
@@ -89,6 +90,9 @@ class PrivacyBlurOperator:
     def __init__(self, config: PrivacyBlurConfig | None = None):
         self.config = config or PrivacyBlurConfig()
         self._detectors: tuple | None = None
+        self._semaphore = threading.BoundedSemaphore(
+            max(1, self.config.max_concurrency)
+        )
 
     def _ensure_detectors(self):
         """Load face/LP detectors once, reuse across episodes."""
@@ -106,7 +110,7 @@ class PrivacyBlurOperator:
     def run(self, episode_dir: Path, **kwargs) -> OperatorResult:
         from .blur_privacy import blur_video
 
-        video_path = episode_dir / "rgb.mp4"
+        video_path = resolve_episode_video_path(episode_dir)
         output_path = episode_dir / "rgb_blurred.mp4"
 
         if not video_path.exists():
@@ -115,39 +119,35 @@ class PrivacyBlurOperator:
                 errors=[f"Video not found: {video_path}"],
             )
 
-        self._ensure_detectors()
+        with self._semaphore:
+            self._ensure_detectors()
 
-        try:
-            summary = blur_video(
-                video_path, output_path,
-                face=self.config.face, lp=self.config.lp,
-                scale=self.config.scale,
-                face_thresh=self.config.face_thresh,
-                lp_thresh=self.config.lp_thresh,
-                detectors=self._detectors,
-            )
-            report_path = episode_dir / "blur_report.json"
-            report_path.write_text(
-                json.dumps(summary, indent=2, ensure_ascii=False, default=str),
-                encoding="utf-8",
-            )
+            try:
+                summary = blur_video(
+                    video_path, output_path,
+                    face=self.config.face, lp=self.config.lp,
+                    scale=self.config.scale,
+                    face_thresh=self.config.face_thresh,
+                    lp_thresh=self.config.lp_thresh,
+                    detectors=self._detectors,
+                )
 
-            # After segment blur completes, try to concat all segments → episode root
-            ep_root = _episode_root(episode_dir)
-            if ep_root != episode_dir:
-                try:
-                    _concat_blurred_to_root(ep_root)
-                except Exception as e:
-                    log.warning(f"concat to episode root failed (non-fatal): {e}")
+                # Segment-level runs opportunistically assemble an episode-level blurred video.
+                ep_root = _episode_root(episode_dir)
+                if ep_root != episode_dir:
+                    try:
+                        _concat_blurred_to_root(ep_root)
+                    except Exception as e:
+                        log.warning(f"concat to episode root failed (non-fatal): {e}")
 
-            return OperatorResult(
-                status="ok", operator=self.name,
-                output_files=[str(output_path), str(report_path)],
-                metrics=summary,
-            )
-        except Exception as e:
-            log.exception("privacy_blur failed")
-            return OperatorResult(
-                status="error", operator=self.name,
-                errors=[str(e)],
-            )
+                return OperatorResult(
+                    status="ok", operator=self.name,
+                    output_files=[str(output_path)],
+                    metrics=summary,
+                )
+            except Exception as e:
+                log.exception("privacy_blur failed")
+                return OperatorResult(
+                    status="error", operator=self.name,
+                    errors=[str(e)],
+                )

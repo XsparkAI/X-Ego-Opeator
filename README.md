@@ -14,7 +14,7 @@ conda activate ego_operator
 
 ```bash
 pip install -U pip setuptools wheel
-pip install pyyaml numpy opencv-python pillow pandas scipy pyarrow tqdm dashscope openai
+pip install pyyaml numpy opencv-python pillow pandas scipy pyarrow tqdm dashscope openai httpx[socks]
 ```
 
 ## 3. 安装 YOLO / Torch 依赖

@@ -12,6 +12,7 @@ import argparse
 import json
 import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -20,6 +21,11 @@ import subprocess
 import cv2
 import numpy as np
 
+from ..frame_cache.cache_utils import (
+    build_sample_fps_frame_ids,
+    load_cached_quality_frames,
+    probe_video,
+)
 from . import op_quality, op_stability, op_exposure
 
 logging.basicConfig(
@@ -165,6 +171,27 @@ def _read_frames_cpu(video_path: str, sample_fps: Optional[float]):
 
 def read_frames(video_path: str, sample_fps: Optional[float] = None):
     """读取视频帧，优先 NVDEC 硬件解码，失败回退 CPU 软解码"""
+    episode_dir = Path(video_path).parent
+    try:
+        fps, total_frames = probe_video(Path(video_path))
+        frame_ids = build_sample_fps_frame_ids(fps, total_frames, sample_fps)
+        cached = load_cached_quality_frames(episode_dir, frame_ids)
+        if cached is not None:
+            frames_gray, frame_indices, meta = cached
+            step = (
+                max(1, int(round(fps / sample_fps)))
+                if sample_fps and sample_fps < fps else 1
+            )
+            meta["step"] = step
+            log.info(
+                f"Video: {meta['width']}x{meta['height']}, {meta['fps']:.1f}fps, "
+                f"{meta['total_frames']} frames, sample_step={step}, "
+                f"decoder=frame_cache"
+            )
+            return frames_gray, frame_indices, meta
+    except Exception as e:
+        log.warning(f"frame_cache unavailable ({e}), falling back to decoder")
+
     try:
         probe = _probe_video(video_path)
         if probe["codec_name"] == "hevc":
@@ -211,39 +238,54 @@ def process_video(
     stability_summary = None
     exposure_summary = None
 
-    # ---- 算子1: 画面质量 ----
-    if check_quality:
+    def _run_quality():
         t1 = time.time()
         quality_results = [
             op_quality.assess_frame(g, fi) for g, fi in zip(frames_gray, frame_indices)
         ]
-        t1_elapsed = time.time() - t1
-        log.info(f"Operator 1 (quality):   {t1_elapsed:.3f}s  ({t1_elapsed/n*1000:.2f} ms/frame)")
-        quality_summary = op_quality.summarize(quality_results, fps=fps)
-    else:
-        log.info("Operator 1 (quality):   跳过")
+        elapsed = time.time() - t1
+        return "quality", elapsed, op_quality.summarize(quality_results, fps=fps)
 
-    # ---- 算子2: 稳定性 ----
-    if check_stability:
+    def _run_stability():
         t2 = time.time()
         stability_result = op_stability.assess(frames_gray, fps / step, frame_indices)
-        t2_elapsed = time.time() - t2
-        log.info(f"Operator 2 (stability): {t2_elapsed:.3f}s  ({t2_elapsed/n*1000:.2f} ms/frame)")
-        stability_summary = op_stability.summarize(stability_result, fps=fps)
-    else:
-        log.info("Operator 2 (stability): 跳过")
+        elapsed = time.time() - t2
+        return "stability", elapsed, op_stability.summarize(stability_result, fps=fps)
 
-    # ---- 算子3: 曝光 ----
-    if check_exposure:
+    def _run_exposure():
         t3 = time.time()
         exposure_results = [
             op_exposure.assess_frame(g, fi) for g, fi in zip(frames_gray, frame_indices)
         ]
-        t3_elapsed = time.time() - t3
-        log.info(f"Operator 3 (exposure):  {t3_elapsed:.3f}s  ({t3_elapsed/n*1000:.2f} ms/frame)")
-        exposure_summary = op_exposure.summarize(exposure_results, fps=fps)
+        elapsed = time.time() - t3
+        return "exposure", elapsed, op_exposure.summarize(exposure_results, fps=fps)
+
+    tasks = []
+    if check_quality:
+        tasks.append(_run_quality)
+    else:
+        log.info("Operator 1 (quality):   跳过")
+    if check_stability:
+        tasks.append(_run_stability)
+    else:
+        log.info("Operator 2 (stability): 跳过")
+    if check_exposure:
+        tasks.append(_run_exposure)
     else:
         log.info("Operator 3 (exposure):  跳过")
+
+    if tasks:
+        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
+            for name, elapsed, summary in [f.result() for f in [pool.submit(task) for task in tasks]]:
+                if name == "quality":
+                    quality_summary = summary
+                    log.info(f"Operator 1 (quality):   {elapsed:.3f}s  ({elapsed/n*1000:.2f} ms/frame)")
+                elif name == "stability":
+                    stability_summary = summary
+                    log.info(f"Operator 2 (stability): {elapsed:.3f}s  ({elapsed/n*1000:.2f} ms/frame)")
+                elif name == "exposure":
+                    exposure_summary = summary
+                    log.info(f"Operator 3 (exposure):  {elapsed:.3f}s  ({elapsed/n*1000:.2f} ms/frame)")
 
     total_time = time.time() - t0
 

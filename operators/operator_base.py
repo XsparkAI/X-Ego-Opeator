@@ -1,8 +1,7 @@
-"""Minimal protocol and result type for Ego-X operators.
+"""Shared protocol and result type for Ego-X pipeline operators.
 
-Every operator adapter implements the ``Operator`` protocol so that the
-pipeline can orchestrate them uniformly.  Existing standalone scripts are
-**not** modified -- operator implementations live alongside them (``op_impl.py``).
+Each operator exposes a lightweight adapter in ``op_impl.py`` so the
+pipeline can orchestrate heterogeneous modules through one interface.
 """
 
 from __future__ import annotations
@@ -14,9 +13,9 @@ from typing import Any, Protocol, runtime_checkable
 
 @dataclass
 class OperatorResult:
-    """Uniform return type for all operators."""
+    """Normalized result payload returned by every operator."""
 
-    status: str  # "ok" | "error" | "skipped"
+    status: str  # "ok" | "error" | "skipped" | "pending"
     operator: str  # operator name, e.g. "privacy_blur"
     output_files: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
@@ -25,10 +24,10 @@ class OperatorResult:
 
 @runtime_checkable
 class Operator(Protocol):
-    """Protocol that every operator adapter must satisfy."""
+    """Interface that every pipeline operator adapter must satisfy."""
 
     name: str
 
     def run(self, episode_dir: Path, **kwargs: Any) -> OperatorResult:
-        """Process one episode directory. Returns OperatorResult."""
+        """Process one work directory and return an ``OperatorResult``."""
         ...

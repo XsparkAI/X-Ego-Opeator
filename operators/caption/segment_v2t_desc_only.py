@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Video segmentation using video2tasks windowing approach — SOP description-only variant.
+Single-task caption generation using video2tasks windowing approach — SOP description-only variant.
 
 Difference from segment_v2t.py: prompt includes SOP step descriptions (no visual_cue/completion_cue).
 
@@ -9,7 +9,7 @@ Core algorithm (from ~/Desktop/zijian/ego/Ego_Pipeline/video2tasks):
   2. Send frames to VLM with SOP context → detect transitions per window
   3. Cluster transitions across windows using Hanning-weighted voting
   4. Snap final cut points to IMU acceleration valleys (FusionX enhancement)
-  5. Assemble segments with SOP step labels
+  5. Assemble a unified caption with one task and multiple atomic actions
 
 Usage:
   python segment_v2t.py                           # Process all episodes
@@ -34,6 +34,18 @@ import cv2
 import numpy as np
 import pandas as pd
 from scipy.signal import savgol_filter, find_peaks
+try:
+    from ..video_path import episode_has_input_video, resolve_episode_video_path
+except ImportError:
+    from video_path import episode_has_input_video, resolve_episode_video_path
+try:
+    from .vlm_api import build_multimodal_message, submit_batch_chat_requests
+except ImportError:
+    from vlm_api import build_multimodal_message, submit_batch_chat_requests
+try:
+    from .scene_classifier import classify_video_scene
+except ImportError:
+    from scene_classifier import classify_video_scene
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -56,6 +68,8 @@ TASK_SOP_MAP = {
 # ── VLM Config ───────────────────────────────────────────────────────────────
 API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 MODEL = "qwen3.5-plus"
+THINKING_BUDGET = 256
+EXTRA_BODY = {"enable_thinking": True, "thinking_budget": THINKING_BUDGET}
 
 # ── Windowing Config (from video2tasks) ──────────────────────────────────────
 WINDOW_SEC = 10.0          # Window duration in seconds
@@ -265,61 +279,64 @@ If transitions is empty, instructions should have exactly 1 element describing t
 
 
 def vlm_analyze_window(video_path: str, window: Window, sop: dict, fps: float) -> tuple[dict | None, int, int]:
-    """Send window frames to VLM, get transition analysis.
+    """Send window frames through the batch API and return parsed JSON."""
+    frames_b64 = extract_frames_b64(video_path, window.frame_ids)
+    if not frames_b64:
+        return None, 0, 0
 
-    Returns (result_dict, input_tokens, output_tokens).
-    """
-    from dashscope import MultiModalConversation
+    prompt = build_window_prompt(sop, len(frames_b64), window, fps)
+    responses = submit_batch_chat_requests(
+        [
+            {
+                "custom_id": f"desc_win_{window.window_id}",
+                "model": MODEL,
+                "messages": build_multimodal_message(frames_b64, prompt),
+            }
+        ],
+        model=MODEL,
+        extra_body=EXTRA_BODY,
+    )
+    raw = responses.get(f"desc_win_{window.window_id}", {}).get("text")
+    json_match = re.search(r'\{.*\}', raw or "", re.DOTALL)
+    if not json_match:
+        return None, 0, 0
+    try:
+        return json.loads(json_match.group()), 0, 0
+    except json.JSONDecodeError:
+        return None, 0, 0
 
-    in_tok, out_tok = 0, 0
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        frame_paths = save_frames_as_tmp_jpg(video_path, window.frame_ids, tmp_dir)
-        if not frame_paths:
-            return None, 0, 0
+def vlm_analyze_windows_batch(video_path: str, windows: list[Window], sop: dict, fps: float) -> tuple[list[dict | None], int, int]:
+    requests = []
+    for window in windows:
+        frames_b64 = extract_frames_b64(video_path, window.frame_ids)
+        if not frames_b64:
+            continue
+        prompt = build_window_prompt(sop, len(frames_b64), window, fps)
+        requests.append(
+            {
+                "custom_id": f"desc_win_{window.window_id}",
+                "model": MODEL,
+                "messages": build_multimodal_message(frames_b64, prompt),
+            }
+        )
 
-        prompt = build_window_prompt(sop, len(frame_paths), window, fps)
+    if not requests:
+        return [None] * len(windows), 0, 0
 
-        content = [{"image": f"file://{p}"} for p in frame_paths]
-        content.append({"text": prompt})
-
-        messages = [{"role": "user", "content": content}]
-
-        for attempt in range(3):
-            try:
-                response = MultiModalConversation.call(
-                    api_key=API_KEY, model=MODEL, messages=messages,
-                )
-                if response.status_code != 200:
-                    log.warning(f"  VLM API error (attempt {attempt+1}): {response.code} - {response.message}")
-                    continue
-
-                # Track tokens
-                if hasattr(response, "usage") and response.usage:
-                    _token_stats["calls"] += 1
-                    cur_in = getattr(response.usage, "input_tokens", 0)
-                    cur_out = getattr(response.usage, "output_tokens", 0)
-                    _token_stats["input_tokens"] += cur_in
-                    _token_stats["output_tokens"] += cur_out
-                    in_tok += cur_in
-                    out_tok += cur_out
-
-                raw = response.output.choices[0].message.content
-                if not isinstance(raw, str):
-                    raw = raw[0]["text"]
-
-                # Parse JSON
-                json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
-                    return result, in_tok, out_tok
-                else:
-                    log.warning(f"  Cannot parse JSON from VLM (attempt {attempt+1})")
-
-            except Exception as e:
-                log.warning(f"  VLM call failed (attempt {attempt+1}): {e}")
-
-    return None, in_tok, out_tok
+    responses = submit_batch_chat_requests(requests, model=MODEL, extra_body=EXTRA_BODY)
+    by_id = {}
+    for req in requests:
+        raw = responses.get(req["custom_id"], {}).get("text")
+        m = re.search(r'\{.*\}', raw or "", re.DOTALL)
+        if not m:
+            by_id[req["custom_id"]] = None
+            continue
+        try:
+            by_id[req["custom_id"]] = json.loads(m.group())
+        except json.JSONDecodeError:
+            by_id[req["custom_id"]] = None
+    return [by_id.get(f"desc_win_{window.window_id}") for window in windows], 0, 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -525,31 +542,22 @@ Steps:
 
 Output:"""
 
-    import openai
-    _refine_client = openai.OpenAI(
-        api_key=API_KEY,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    )
-
     in_tok, out_tok = 0, 0
 
     for attempt in range(3):
         try:
-            response = _refine_client.chat.completions.create(
+            responses = submit_batch_chat_requests(
+                [
+                    {
+                        "custom_id": "refine_segments",
+                        "model": MODEL,
+                        "messages": build_multimodal_message([], prompt),
+                    }
+                ],
                 model=MODEL,
-                messages=[{"role": "user", "content": prompt}],
+                extra_body=EXTRA_BODY,
             )
-
-            _token_stats["calls"] += 1
-            if response.usage:
-                cur_in = response.usage.prompt_tokens or 0
-                cur_out = response.usage.completion_tokens or 0
-                _token_stats["input_tokens"] += cur_in
-                _token_stats["output_tokens"] += cur_out
-                in_tok += cur_in
-                out_tok += cur_out
-
-            raw = response.choices[0].message.content or ""
+            raw = responses.get("refine_segments", {}).get("text") or ""
             json_match = re.search(r'\[.*\]', raw, re.DOTALL)
             if not json_match:
                 log.warning(f"  Refine: cannot parse JSON (attempt {attempt+1})")
@@ -649,7 +657,7 @@ def discover_episodes(task_filter: str | None = None, episode_filter: str | None
     for ep_dir in sorted(DATA_ROOT.iterdir()):
         if not ep_dir.is_dir():
             continue
-        if not (ep_dir / "rgb.mp4").exists():
+        if not episode_has_input_video(ep_dir):
             continue
 
         name = ep_dir.name
@@ -680,7 +688,7 @@ def process_episode(episode_dir: Path, sop: dict, preview: bool = False, dry_run
     Returns (caption, metrics). metrics is None only for dry_run.
     """
     name = episode_dir.name
-    rgb_path = str(episode_dir / "rgb.mp4")
+    rgb_path = str(resolve_episode_video_path(episode_dir))
     t_total_start = time.time()
 
     # Get video info
@@ -712,30 +720,17 @@ def process_episode(episode_dir: Path, sop: dict, preview: bool = False, dry_run
     valleys = find_imu_valleys(episode_dir)
 
     # ── Phase 1: VLM window analysis (parallel) ──
-    log.info(f"[{name}] Analyzing {len(windows)} windows in parallel...")
-    window_results = [None] * len(windows)
+    log.info(f"[{name}] Submitting scene + {len(windows)} windows via batch API...")
     t_wind_start = time.time()
     wind_in_tok, wind_out_tok = 0, 0
     wind_calls = 0
-
-    def _analyze(idx_win):
-        idx, w = idx_win
-        log.info(f"[{name}] Window {w.window_id}/{len(windows)-1} "
-                 f"[{w.start_frame}-{w.end_frame}] ({(w.end_frame-w.start_frame)/fps:.1f}s)")
-        result, w_in, w_out = vlm_analyze_window(rgb_path, w, sop, fps)
-        if result:
-            log.info(f"[{name}] Window {w.window_id} → {len(result.get('transitions', []))} transitions")
-        else:
-            log.warning(f"[{name}] Window {w.window_id} → VLM returned no result")
-        return idx, result, w_in, w_out
-
-    with ThreadPoolExecutor(max_workers=min(8, len(windows))) as pool:
-        for idx, result, w_in, w_out in pool.map(_analyze, enumerate(windows)):
-            window_results[idx] = result
-            wind_in_tok += w_in
-            wind_out_tok += w_out
-            if result is not None:
-                wind_calls += 1
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_scene = pool.submit(classify_video_scene, rgb_path, fps=fps, nframes=nframes)
+        future_windows = pool.submit(vlm_analyze_windows_batch, rgb_path, windows, sop, fps)
+        scene = future_scene.result()
+        window_results, wind_in_tok, wind_out_tok = future_windows.result()
+    log.info(f"[{name}] Scene: {scene}")
+    wind_calls = sum(1 for result in window_results if result is not None)
 
     metrics.windowing = PhaseMetrics(
         elapsed_sec=time.time() - t_wind_start,
@@ -759,16 +754,19 @@ def process_episode(episode_dir: Path, sop: dict, preview: bool = False, dry_run
 
     # Build output caption
     caption = {
-        "instruction": sop["task_name"],
-        "sop_file": str(Path("sop") / TASK_SOP_MAP.get(get_task_type(name) or "", "")),
-        "method": "v2t_desc_only",
-        "atomic_action": [
+        "scene": scene,
+        "tasks": [
             {
-                "frame_interval": seg["frame_interval"],
-                "instruction": seg["instruction"],
-                "sop_step_index": seg["sop_step_index"],
+                "instruction": sop["task_name"],
+                "frame_interval": [0, nframes],
+                "atomic_actions": [
+                    {
+                        "frame_interval": seg["frame_interval"],
+                        "caption": seg["instruction"],
+                    }
+                    for seg in segments
+                ],
             }
-            for seg in segments
         ],
     }
 
@@ -779,12 +777,14 @@ def process_episode(episode_dir: Path, sop: dict, preview: bool = False, dry_run
 
     # Print summary
     print(f"\n{'─' * 60}")
-    print(f"  {name}: {caption['instruction']}")
-    print(f"  Segments: {len(caption['atomic_action'])}")
-    for a in caption["atomic_action"]:
+    task = caption["tasks"][0]
+    print(f"  {name}: {task['instruction']}")
+    print(f"  Scene: {caption.get('scene', 'unknown')}")
+    print(f"  Segments: {len(task['atomic_actions'])}")
+    for i, a in enumerate(task["atomic_actions"], start=1):
         s, e = a["frame_interval"]
         dur = (e - s) / fps
-        print(f"    Step {a['sop_step_index']}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['instruction']}")
+        print(f"    Step {i}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['caption']}")
     print(f"{'─' * 60}")
 
     # ── Phase 4: Preview ──
@@ -832,7 +832,7 @@ def _apply_rotation(frame: np.ndarray, rotation: int) -> np.ndarray:
 
 def generate_preview(episode_dir: Path, caption: dict, fps: float) -> Path:
     """Generate preview video with subtitle overlay."""
-    rgb_path = str(episode_dir / "rgb.mp4")
+    rgb_path = str(resolve_episode_video_path(episode_dir))
     out_path = episode_dir / f"preview_caption_{OUTPUT_SUFFIX}.mp4"
     tmp_path = episode_dir / f"preview_caption_{OUTPUT_SUFFIX}.tmp.mp4"
 
@@ -846,7 +846,8 @@ def generate_preview(episode_dir: Path, caption: dict, fps: float) -> Path:
         W, H = H, W
     writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
 
-    actions = caption.get("atomic_action", [])
+    tasks = caption.get("tasks", [])
+    actions = tasks[0].get("atomic_actions", []) if tasks else []
 
     fidx = 0
     while True:
@@ -855,10 +856,10 @@ def generate_preview(episode_dir: Path, caption: dict, fps: float) -> Path:
             break
         if rotation:
             frame = _apply_rotation(frame, rotation)
-        for a in actions:
+        for step_idx, a in enumerate(actions, start=1):
             s, e = a["frame_interval"]
             if s <= fidx < e:
-                text = f"[Step {a.get('sop_step_index', '?')}] {a['instruction']}"
+                text = f"[Step {step_idx}] {a.get('caption', a.get('instruction', ''))}"
                 frame = _render_subtitle(frame, text)
                 break
         writer.write(frame)

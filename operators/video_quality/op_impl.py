@@ -10,6 +10,8 @@ from pathlib import Path
 import cv2
 
 from ..operator_base import OperatorResult
+from ..video_path import resolve_episode_video_path
+from ..vlm_limit import cpu_task_slot
 
 log = logging.getLogger(__name__)
 
@@ -120,6 +122,7 @@ class VideoQualityConfig:
     check_quality: bool = True
     check_stability: bool = True
     check_exposure: bool = True
+    save_flagged_frames: bool = False
 
 
 class VideoQualityOperator:
@@ -131,7 +134,7 @@ class VideoQualityOperator:
     def run(self, episode_dir: Path, **kwargs) -> OperatorResult:
         from .assess import process_video
 
-        video_path = episode_dir / "rgb.mp4"
+        video_path = resolve_episode_video_path(episode_dir)
         output_path = episode_dir / "quality_report.json"
 
         if not video_path.exists():
@@ -141,13 +144,14 @@ class VideoQualityOperator:
             )
 
         try:
-            result = process_video(
-                str(video_path),
-                sample_fps=self.config.sample_fps,
-                check_quality=self.config.check_quality,
-                check_stability=self.config.check_stability,
-                check_exposure=self.config.check_exposure,
-            )
+            with cpu_task_slot():
+                result = process_video(
+                    str(video_path),
+                    sample_fps=self.config.sample_fps,
+                    check_quality=self.config.check_quality,
+                    check_stability=self.config.check_stability,
+                    check_exposure=self.config.check_exposure,
+                )
             output_path.write_text(
                 json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
             )
@@ -196,10 +200,11 @@ class VideoQualityOperator:
             # "episode" key for non-fan-out, segment name for fan-out
             seg_name = episode_dir.name if episode_dir != ep_root else "episode"
 
-            try:
-                _extract_quality_frames(video_path, result, ep_root, seg_pfx)
-            except Exception as e:
-                log.warning(f"quality frame extraction failed (non-fatal): {e}")
+            if self.config.save_flagged_frames:
+                try:
+                    _extract_quality_frames(video_path, result, ep_root, seg_pfx)
+                except Exception as e:
+                    log.warning(f"quality frame extraction failed (non-fatal): {e}")
 
             try:
                 _update_episode_quality_report(ep_root, seg_name, result)

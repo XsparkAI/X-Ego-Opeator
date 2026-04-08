@@ -2,6 +2,7 @@
 """算子2: 视频稳定性检测 — 基于光流追踪 + 仿射估计（纯 OpenCV 接口）"""
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
@@ -34,6 +35,45 @@ class StabilityResult:
     pair_motions: list  # list[FramePairMotion]
 
 
+def _assess_pair(args: tuple[np.ndarray, np.ndarray, int, int]) -> tuple[float, float, float, int, FramePairMotion] | None:
+    prev, curr, frame_idx_from, frame_idx_to = args
+
+    pts = cv2.goodFeaturesToTrack(prev, FEATURE_MAX_CORNERS, FEATURE_QUALITY, FEATURE_MIN_DIST)
+    if pts is None or len(pts) < 4:
+        return None
+
+    pts_new, status, _ = cv2.calcOpticalFlowPyrLK(prev, curr, pts, None)
+    good_old = pts[status.flatten() == 1]
+    good_new = pts_new[status.flatten() == 1]
+
+    if len(good_old) < 4:
+        return None
+
+    mat, inliers = cv2.estimateAffinePartial2D(good_old, good_new)
+    if mat is None:
+        return None
+
+    dx = float(mat[0, 2])
+    dy = float(mat[1, 2])
+    da = float(np.arctan2(mat[1, 0], mat[0, 0]))
+    mc = int(inliers.sum()) if inliers is not None else len(good_old)
+    trans = float(np.sqrt(dx ** 2 + dy ** 2))
+
+    return (
+        dx,
+        dy,
+        da,
+        mc,
+        FramePairMotion(
+            frame_idx_from=frame_idx_from,
+            frame_idx_to=frame_idx_to,
+            translation=trans,
+            rotation=float(abs(da)),
+            matched_points=mc,
+        ),
+    )
+
+
 def assess(frames_gray: list[np.ndarray], fps: float,
            frame_indices: list[int] | None = None) -> StabilityResult:
     """评估视频稳定性：Shi-Tomasi 特征 + Lucas-Kanade 光流 + 仿射估计"""
@@ -44,42 +84,22 @@ def assess(frames_gray: list[np.ndarray], fps: float,
     if frame_indices is None:
         frame_indices = list(range(len(frames_gray)))
 
-    for i in range(1, len(frames_gray)):
-        prev, curr = frames_gray[i - 1], frames_gray[i]
+    pair_args = [
+        (frames_gray[i - 1], frames_gray[i], frame_indices[i - 1], frame_indices[i])
+        for i in range(1, len(frames_gray))
+    ]
+    max_workers = min(8, max(1, len(pair_args)))
 
-        pts = cv2.goodFeaturesToTrack(prev, FEATURE_MAX_CORNERS, FEATURE_QUALITY, FEATURE_MIN_DIST)
-        if pts is None or len(pts) < 4:
-            continue
-
-        pts_new, status, _ = cv2.calcOpticalFlowPyrLK(prev, curr, pts, None)
-        good_old = pts[status.flatten() == 1]
-        good_new = pts_new[status.flatten() == 1]
-
-        if len(good_old) < 4:
-            continue
-
-        mat, inliers = cv2.estimateAffinePartial2D(good_old, good_new)
-        if mat is None:
-            continue
-
-        dx = mat[0, 2]
-        dy = mat[1, 2]
-        da = np.arctan2(mat[1, 0], mat[0, 0])
-        mc = int(inliers.sum()) if inliers is not None else len(good_old)
-
-        dx_list.append(dx)
-        dy_list.append(dy)
-        da_list.append(da)
-        matched_counts.append(mc)
-
-        trans = float(np.sqrt(dx ** 2 + dy ** 2))
-        pair_motions.append(FramePairMotion(
-            frame_idx_from=frame_indices[i - 1],
-            frame_idx_to=frame_indices[i],
-            translation=trans,
-            rotation=float(abs(da)),
-            matched_points=mc,
-        ))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for result in pool.map(_assess_pair, pair_args):
+            if result is None:
+                continue
+            dx, dy, da, mc, pair_motion = result
+            dx_list.append(dx)
+            dy_list.append(dy)
+            da_list.append(da)
+            matched_counts.append(mc)
+            pair_motions.append(pair_motion)
 
     if not dx_list:
         return StabilityResult(0.0, 0.0, 0.0, [])

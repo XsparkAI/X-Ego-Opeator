@@ -8,7 +8,7 @@ Usage:
   python detect_hand_in_frame.py --video path/to/rgb.mp4
   python detect_hand_in_frame.py --video path/to/rgb.mp4 --output hand_detection.json
   python detect_hand_in_frame.py --video path/to/rgb.mp4 --conf 0.3 --step 1
-  python detect_hand_in_frame.py --episode path/to/episode_dir    # reads rgb.mp4, writes hand_detection.json
+  python detect_hand_in_frame.py --episode path/to/episode_dir    # reads configured input video, writes hand_detection.json
   python detect_hand_in_frame.py --video path/to/rgb.mp4 --preview   # also generate preview video
 """
 
@@ -22,6 +22,14 @@ import cv2
 import numpy as np
 import torch
 from ultralytics import YOLO
+
+try:
+    from ..video_path import resolve_episode_video_path
+except ImportError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from video_path import resolve_episode_video_path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -263,8 +271,8 @@ def generate_preview(
 
 
 def process_episode(episode_dir: Path, conf_thresh: float = 0.3, frame_step: int = 1) -> Path:
-    """Process a single episode directory (reads rgb.mp4, writes hand_detection.json)."""
-    video_path = episode_dir / "rgb.mp4"
+    """Process a single episode directory (reads configured input video, writes hand_detection.json)."""
+    video_path = resolve_episode_video_path(episode_dir)
     output_path = episode_dir / "hand_detection.json"
 
     if not video_path.exists():
@@ -283,7 +291,7 @@ def main():
     parser = argparse.ArgumentParser(description="YOLO hand-in-frame detection operator")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--video", type=Path, help="Path to video file")
-    group.add_argument("--episode", type=Path, help="Episode directory (reads rgb.mp4)")
+    group.add_argument("--episode", type=Path, help="Episode directory (reads configured input video)")
     parser.add_argument("--output", type=Path, default=None, help="Output JSON path (--video mode only)")
     parser.add_argument("--conf", type=float, default=0.3, help="YOLO confidence threshold (default: 0.3)")
     parser.add_argument("--step", type=int, default=1, help="Process every N-th frame (default: 1)")

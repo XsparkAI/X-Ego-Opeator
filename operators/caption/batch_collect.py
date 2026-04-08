@@ -27,6 +27,11 @@ from segment_v2t import (
     build_segments_via_cuts, generate_preview,
     get_task_type, Window,
 )
+from scene_classifier import classify_video_scene
+try:
+    from ..video_path import resolve_episode_video_path
+except ImportError:
+    from video_path import resolve_episode_video_path
 
 PROJECT_ROOT = SCRIPT_DIR.parent.parent
 BATCH_TMP_DIR = PROJECT_ROOT / "tmp" / "batch"
@@ -221,33 +226,39 @@ def main():
                 log.warning(f"[{episode_name}] Refine failed: {e}, using raw segments")
 
         # Build caption output
+        ep_dir = data_root / episode_name
+        scene = classify_video_scene(resolve_episode_video_path(ep_dir), fps=fps, nframes=ep_state["nframes"])
         caption = {
-            "instruction": sop["task_name"],
-            "sop_file": str(Path("sop") / TASK_SOP_MAP.get(task_type, "")),
-            "method": f"{output_suffix}_batch",
-            "atomic_action": [
+            "scene": scene,
+            "tasks": [
                 {
-                    "frame_interval": seg["frame_interval"],
-                    "instruction": seg["instruction"],
-                    "sop_step_index": seg["sop_step_index"],
+                    "instruction": sop["task_name"],
+                    "frame_interval": [0, ep_state["nframes"]],
+                    "atomic_actions": [
+                        {
+                            "frame_interval": seg["frame_interval"],
+                            "caption": seg["instruction"],
+                        }
+                        for seg in segments
+                    ],
                 }
-                for seg in segments
             ],
         }
 
-        ep_dir = data_root / episode_name
         out_path = ep_dir / f"caption_{output_suffix}.json"
         out_path.write_text(json.dumps(caption, ensure_ascii=False, indent=2))
         log.info(f"[{episode_name}] Saved: {out_path}")
 
         # Print segment summary
         print(f"\n{'─' * 60}")
-        print(f"  {episode_name}: {caption['instruction']}")
-        print(f"  Segments: {len(caption['atomic_action'])}")
-        for a in caption["atomic_action"]:
+        task = caption["tasks"][0]
+        print(f"  {episode_name}: {task['instruction']}")
+        print(f"  Scene: {caption.get('scene', 'unknown')}")
+        print(f"  Segments: {len(task['atomic_actions'])}")
+        for i, a in enumerate(task["atomic_actions"], start=1):
             s, e = a["frame_interval"]
             dur = (e - s) / fps
-            print(f"    Step {a['sop_step_index']}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['instruction']}")
+            print(f"    Step {i}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['caption']}")
         print(f"{'─' * 60}")
         total_segments += len(segments)
 

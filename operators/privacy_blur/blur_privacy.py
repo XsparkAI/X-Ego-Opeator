@@ -7,7 +7,7 @@ Detects and blurs faces and license plates in egocentric video.
 Usage:
   python blur_privacy.py --video path/to/rgb.mp4
   python blur_privacy.py --video path/to/rgb.mp4 --output blurred.mp4
-  python blur_privacy.py --episode path/to/episode_dir          # reads rgb.mp4, writes rgb_blurred.mp4
+  python blur_privacy.py --episode path/to/episode_dir          # reads configured input video, writes rgb_blurred.mp4
   python blur_privacy.py --video path/to/rgb.mp4 --scale 1.3    # enlarge blur region by 30%
   python blur_privacy.py --video path/to/rgb.mp4 --preview      # 480p side-by-side comparison
 """
@@ -23,6 +23,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+
+try:
+    from ..video_path import resolve_episode_video_path
+except ImportError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from video_path import resolve_episode_video_path
 
 from ego_blur import ClassID, EgoblurDetector
 from gen2.script.constants import (
@@ -482,7 +490,7 @@ def main():
     parser = argparse.ArgumentParser(description="Privacy blur operator (EgoBlur Gen2)")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--video", type=Path, help="Path to input video")
-    group.add_argument("--episode", type=Path, help="Episode directory (reads rgb.mp4)")
+    group.add_argument("--episode", type=Path, help="Episode directory (reads configured input video)")
     parser.add_argument("--output", type=Path, default=None, help="Output video path (--video mode)")
     parser.add_argument("--scale", type=float, default=1.0, help="Blur region scale factor (default: 1.0)")
     parser.add_argument("--face-thresh", type=float, default=None, help="Face detection threshold")
@@ -491,7 +499,7 @@ def main():
     args = parser.parse_args()
 
     if args.episode:
-        video_path = args.episode / "rgb.mp4"
+        video_path = resolve_episode_video_path(args.episode)
         output_path = args.episode / "rgb_blurred.mp4"
     else:
         video_path = args.video

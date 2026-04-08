@@ -5,20 +5,36 @@
 #   python pipeline.py --config pipeline_config.yaml
 #   python pipeline.py --episode path/to/episode
 #
-# 数据集目录（Episode）必须包含名为 rgb.mp4 的输入视频文件。
+# 数据集目录（Episode）需包含 input_video_path 指定的输入视频。
+
 
 # ── 数据集源（Episode）配置 ───────────────────────────────────────────
-# 选项 1：明确指定数据集目录列表（支持单个路径或列表,包含 rgb.mp4）
-episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/test_episode_10s"
+# 选项 1：明确指定 episode 目录（支持单个路径或列表；目录内需包含 input_video_path 指定的视频）
+episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/bytedance/家务/切菜"
 
 # 选项 2：自动扫描根目录下的所有数据集目录
-# （包含 rgb.mp4 文件的子目录将被视为一个独立的数据集）
+# （包含 input_video_path 指定视频文件的子目录将被视为一个独立的数据集）
 # episode_root: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic"
 
+# 每个 episode 内输入视频的相对路径。
+input_video_path: cam_head.mp4
+
 # ── VLM API 配置 ─────────────────────────────────────────────────── 
-# 用于 video_segmentation 和 hand_analysis(method=vlm) 等 VLM 算子。
+# 用于所有需要调用 DashScope VLM 的算子。
 # 也可通过环境变量 DASHSCOPE_API_KEY 设置（环境变量优先）。
 dashscope_api_key: ""
+
+# 所有 VLM 算子共享的总 API 并发上限。
+# 目前主要由 video_segmentation 与 hand_analysis(method=vlm) 共享。
+vlm_global_max_concurrency: 8
+
+# VLM 手部审核共享采样步长。
+# 会同时作用于 ego_hand_count / active_manipulation / single_person_operation。
+hand_vlm_sample_frame_step: 90
+
+# 全局 CPU 类任务并发上限。
+# 用于 frame_cache / video_quality / segment_cut / transcode 等本地 CPU 或 ffmpeg 任务。
+cpu_global_max_concurrency: 4
 
 # ── 执行模式 ────────────────────────────────────────────────────────
 # parallel: true  — 无依赖关系的算子将并发执行
@@ -33,43 +49,63 @@ on_error: continue
 #   "sequential" — 逐个 episode 串行处理（默认）
 #   "pipeline"   — 流水线模式：各依赖阶段拥有独立工作线程池，
 #                  episode 在阶段间流转，不同 episode 的不同阶段可重叠执行。
+#                  同一 stage 内若包含多个无依赖算子，也会并行执行。
 #                  适用于多 episode 批量处理，可显著提升吞吐量。
 execution_mode: pipeline
 
-# 流水线模式下每阶段的工作线程数（仅 execution_mode=pipeline 时生效）。
-# 列表长度应等于依赖阶段数。默认每阶段 1 个 worker。
-# 当前默认 3 阶段：
-#   Stage 1 (video_quality + hand_analysis)   — CPU/GPU 混合
-#   Stage 2 (privacy_blur)                    — GPU 密集
-#   Stage 3 (transcode, 如已启用)             — CPU 密集
-# 建议按算子耗时比例分配，如 privacy_blur 耗时最长可分配更多 worker。
-stage_workers: [4, 3, 2]
+# 流水线模式下，stage worker 数默认会跟随 cpu_global_max_concurrency。
+# 如需精细覆盖，使用命令行参数 `--stage-workers`，不建议作为常规调参入口。
 
 # ── 算子配置 ────────────────────────────────────────────────────────
-# 算子执行顺序固定如下：
+# 算子调度顺序固定如下：
+#   0. frame_cache        — 预抽取下游复用的稀疏帧缓存
 #   1. video_segmentation — 基于 VLM 将视频分割为任务步骤（输出 caption_v2t.json）
-#   2. segment_cut        — 按分割结果裁剪短视频（减少后续 I/O 压力）
-#   3. video_quality      — 评估视频质量（在短片段上运行）
-#   4. hand_analysis      — 手部分析（method: yolo 逐帧检测 | vlm 语义分析）
-#   5. privacy_blur       — 模糊人脸与车牌（隐私保护）
+#   2. segment_cut        — 按分割结果裁剪短视频，可将后续处理 fan-out 到 segments/
+#   3. video_quality      — 视频质量评估
+#   4. hand_analysis      — 手部分析（yolo 或 vlm）
+#   5. privacy_blur       — 模糊人脸与车牌
 #   6. transcode          — 视频格式转码
 #
 # 将 enabled 设为 false 可跳过对应算子。
 # 若完全省略某个算子配置块，则使用默认值（即 enabled: true）。
 #
-# 启用 video_segmentation + segment_cut 后，后续算子将对每个裁剪片段
-# 独立运行（fan-out 模式），大幅减少长视频的解码开销。
+# 当前依赖关系摘要：
+#   frame_cache -> video_segmentation / hand_analysis / video_qua lity
+#   video_segmentation -> segment_cut
+#   privacy_blur 不依赖 segment_cut，可直接在当前 work_dir 上运行
+#   transcode 优先消费 rgb_blurred.mp4，因此默认依赖 privacy_blur
+#   若 video_segmentation 关闭，则 segment_cut 会自动跳过
+#
+# 并发控制默认只保留两个全局接口：
+#   cpu_global_max_concurrency  — 控制全局 CPU / ffmpeg 类任务并发
+#   vlm_global_max_concurrency  — 控制所有 VLM 算子共享的 API 并发上限
+#
+
 
 operators:
+  frame_cache:
+    enabled: true            # 预抽取 video_segmentation / hand_analysis / video_quality 可复用的稀疏帧
+
   video_segmentation:
     enabled: true            # VLM 分段标注
+    method: task_action_v2t      # "segment_v2t" | "task_action_v2t"
+    batch_enabled: false      # true=默认 batch 提交；false=直接请求，不走 batch
+    batch_poll_interval_sec: 20
     window_sec: 10.0
     step_sec: 5.0
-    frames_per_window: 8     
+    frames_per_window: 8
+    max_workers: 8           # 非 batch 模式下，单个 episode 内部并行分析窗口数
+    task_window_sec: 12.0     # 仅 task_action_v2t 生效：任务层窗口长度
+    task_step_sec: 6.0        # 仅 task_action_v2t 生效：任务层滑窗步长
+    task_frames_per_window: 12
+    action_window_sec: 6.0    # 仅 task_action_v2t 生效：原子动作层窗口长度
+    action_step_sec: 3.0      # 仅 task_action_v2t 生效：原子动作层滑窗步长
+    action_frames_per_window: 8
 
   segment_cut:
-    enabled: true            # 按标注裁剪短视频
+    enabled: true           # 按 caption_v2t.json 裁剪短视频；若 video_segmentation 关闭会自动跳过
     min_duration_sec: 0.5    # 跳过短于此秒数的片段
+    granularity: task  # "atomic_action" | "task"
 
   video_quality:
     enabled: true
@@ -79,22 +115,27 @@ operators:
     check_quality: true      # 画面质量检测（模糊帧）
     check_stability: true    # 视频稳定性检测（抖动帧）
     check_exposure: true     # 曝光与光照检测（过曝/欠曝帧）
+    save_flagged_frames: false  # 是否导出不合格帧图片，默认关闭
 
   hand_analysis:
     enabled: true
-    # method: 手部检测后端，二选一
+    # method: 手部分析后端，二选一
     #   "yolo" — YOLO 逐帧检测，速度快，输出 bbox + 置信度（默认）
     #   "vlm"  — VLM 语义分析，能区分拍摄者/他人手部、检测遮挡，但依赖 API
+    #            默认直接在当前视频上均匀抽帧；若前面发生 fan-out，则会处理 segment 视频
     method: vlm
-    frame_step: 120            # 步长：每隔 N 帧处理一次（1=逐帧，VLM 建议 ≥150）
+    save_hand_samples: false   # 是否导出VLM采样帧可视化，默认关闭
+    batch_enabled: false        # 是否使用batch提交
+    max_workers: 8             # 非 batch 模式下控制并发；batch 模式下仅保留为兼容项
     # ── YOLO 专用参数（仅 method=yolo 时生效）──
+    yolo_frame_step: 1         # YOLO 模式下每隔 N 帧处理一次
     conf_thresh: 0.3         # YOLO 检测置信度阈值
     input_height: 720        # 检测前的图像缩放高度
 
   privacy_blur:
     enabled: true
     face_thresh: 0.4      # 覆盖默认的人脸检测阈值
-    lp_thresh: 0.15        # 覆盖默认的车牌检测阈值
+    lp_thresh: 0.3        # 覆盖默认的车牌检测阈值
 
   transcode:
     enabled: false           # 默认关闭

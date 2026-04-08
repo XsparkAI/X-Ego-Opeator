@@ -12,6 +12,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from ..operator_base import OperatorResult
+from ..video_path import resolve_episode_video_path
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,8 @@ def _seg_prefix(work_dir: Path) -> str:
 def _annotate_hand_frame(frame_bgr: np.ndarray, frame_result: dict, fps: float) -> np.ndarray:
     """Draw hand count annotation banner on a frame."""
     cnt = frame_result.get("ego_hand_count", -1)
+    active_manipulation = frame_result.get("active_manipulation")
+    single_person_operation = frame_result.get("single_person_operation")
     success = frame_result.get("success", False)
     frame_idx = frame_result.get("global_frame", 0)
     time_sec = frame_result.get("time_sec", frame_idx / max(fps, 1))
@@ -71,8 +74,20 @@ def _annotate_hand_frame(frame_bgr: np.ndarray, frame_result: dict, fps: float) 
     draw = ImageDraw.Draw(pil)
     draw.text((pad_x, pad_y), label, font=font, fill=(255, 255, 255))
 
-    # Bottom info bar: frame idx + time
-    info = f"#{frame_idx}  {time_sec:.2f}s"
+    # Bottom info bar: frame idx + time + VLM labels
+    if active_manipulation is True:
+        manipulation_text = "active=yes"
+    elif active_manipulation is False:
+        manipulation_text = "active=no"
+    else:
+        manipulation_text = "active=unknown"
+    if single_person_operation is True:
+        solo_text = "solo=yes"
+    elif single_person_operation is False:
+        solo_text = "solo=no"
+    else:
+        solo_text = "solo=unknown"
+    info = f"#{frame_idx}  {time_sec:.2f}s  {manipulation_text}  {solo_text}"
     info_bbox = font_s.getbbox(info)
     iw, ih = info_bbox[2] - info_bbox[0], info_bbox[3] - info_bbox[1]
     ibw, ibh = iw + 16, ih + 12
@@ -125,20 +140,42 @@ def _dump_hand_samples(
     cap.release()
 
 
+def _compact_vlm_audit_output(result: dict) -> dict:
+    summary = result.get("summary", {})
+    frame_results = result.get("frame_results", [])
+    return {
+        "summary": {
+            "total_frames_sampled": summary.get("total_frames_sampled", 0),
+            "avg_ego_hand_count": summary.get("avg_ego_hand_count", 0),
+            "ego_0_hands_ratio": summary.get("ego_0_hands_ratio", 0),
+            "ego_1_hand_ratio": summary.get("ego_1_hand_ratio", 0),
+            "ego_2_hands_ratio": summary.get("ego_2_hands_ratio", 0),
+            "active_manipulation_ratio": summary.get("active_manipulation_ratio", 0),
+            "single_person_operation_ratio": summary.get("single_person_operation_ratio", 0),
+        },
+        "sampled_hand_counts": [
+            {
+                "global_frame": item.get("global_frame", 0),
+                "time_sec": item.get("time_sec", 0),
+                "ego_hand_count": item.get("ego_hand_count", 0),
+                "active_manipulation": item.get("active_manipulation"),
+                "single_person_operation": item.get("single_person_operation"),
+            }
+            for item in frame_results
+        ],
+    }
+
+
 @dataclass
 class HandAnalysisConfig:
-    # ── Backend selection (mutually exclusive) ──────────────────────────
     method: str = "yolo"           # "yolo" | "vlm"
-
-    # ── YOLO-specific ──────────────────────────────────────────────────
     conf_thresh: float = 0.3       # YOLO detection confidence threshold
     input_height: int = 720        # resize height before detection
-
-    # ── Shared ─────────────────────────────────────────────────────────
-    frame_step: int = 1            # process every N-th frame
-
-    # ── VLM-specific ───────────────────────────────────────────────────
-    max_workers: int = 4           # concurrent VLM requests (vlm backend only)
+    yolo_frame_step: int = 1       # process every N-th frame in YOLO mode
+    vlm_sample_frame_step: int = 120  # shared sampling step for VLM hand/person/activity labels
+    max_workers: int = 4           # kept only for compatibility with older VLM configs
+    batch_enabled: bool = True     # whether VLM mode submits one batch job or sends per-frame requests
+    save_hand_samples: bool = False
 
 
 class HandAnalysisOperator:
@@ -165,7 +202,7 @@ class HandAnalysisOperator:
     def _run_yolo(self, episode_dir: Path) -> OperatorResult:
         from .detect_hand_in_frame import detect_hands_in_video
 
-        video_path = episode_dir / "rgb.mp4"
+        video_path = resolve_episode_video_path(episode_dir)
         output_path = episode_dir / "hand_detection.json"
 
         self._ensure_yolo_model()
@@ -173,7 +210,7 @@ class HandAnalysisOperator:
         result = detect_hands_in_video(
             video_path,
             conf_thresh=self.config.conf_thresh,
-            frame_step=self.config.frame_step,
+            frame_step=self.config.yolo_frame_step,
             input_height=self.config.input_height,
             model=self._yolo_model,
         )
@@ -192,39 +229,46 @@ class HandAnalysisOperator:
     def _run_vlm(self, episode_dir: Path) -> OperatorResult:
         from .vlm_hand_audit import audit_video
 
-        video_path = episode_dir / "rgb.mp4"
+        video_path = resolve_episode_video_path(episode_dir)
         output_path = episode_dir / "vlm_hand_audit.json"
 
         result = audit_video(
             video_path,
-            frame_step=self.config.frame_step,
+            frame_step=self.config.vlm_sample_frame_step,
             max_workers=self.config.max_workers,
+            batch_enabled=self.config.batch_enabled,
         )
 
         output_path.write_text(
-            json.dumps(result, indent=2, ensure_ascii=False),
+            json.dumps(_compact_vlm_audit_output(result), indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
 
         summary = result.get("summary", {})
         warnings = []
-        failed = summary.get("failed_responses", 0)
-        total = summary.get("total_frames_sampled", 1)
-        if failed > 0:
-            warnings.append(f"VLM failed on {failed}/{total} sampled frames")
         no_hands_ratio = summary.get("ego_0_hands_ratio", 0)
         if no_hands_ratio > 0.8:
             warnings.append(
                 f"Ego hands absent in {no_hands_ratio*100:.0f}% of sampled frames"
             )
+        active_ratio = summary.get("active_manipulation_ratio", 0)
+        if active_ratio > 0:
+            warnings.append(
+                f"Active manipulation detected in {active_ratio*100:.0f}% of sampled frames"
+            )
+        single_operator_ratio = summary.get("single_person_operation_ratio", 0)
+        warnings.append(
+            f"Single-person operation in {single_operator_ratio*100:.0f}% of sampled frames"
+        )
 
-        # 导出采样帧到 episode 级 hand_samples/ 目录（带手部标注）
+        # Export annotated sampled frames into the episode-level hand_samples/ directory.
         ep_root = _episode_root(episode_dir)
         seg_pfx = _seg_prefix(episode_dir)
-        try:
-            _dump_hand_samples(video_path, result.get("frame_results", []), ep_root, seg_pfx)
-        except Exception as e:
-            log.warning(f"hand sample dump failed (non-fatal): {e}")
+        if self.config.save_hand_samples:
+            try:
+                _dump_hand_samples(video_path, result.get("frame_results", []), ep_root, seg_pfx)
+            except Exception as e:
+                log.warning(f"hand sample dump failed (non-fatal): {e}")
 
         return OperatorResult(
             status="ok", operator=self.name,
@@ -236,7 +280,7 @@ class HandAnalysisOperator:
     # ── Dispatch ───────────────────────────────────────────────────────
 
     def run(self, episode_dir: Path, **kwargs) -> OperatorResult:
-        video_path = episode_dir / "rgb.mp4"
+        video_path = resolve_episode_video_path(episode_dir)
         if not video_path.exists():
             return OperatorResult(
                 status="error", operator=self.name,
