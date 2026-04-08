@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 """
-Video segmentation using video2tasks windowing approach adapted for FusionX.
+Video segmentation via VLM sliding-window analysis.
 
-Core algorithm (from ~/Desktop/zijian/ego/Ego_Pipeline/video2tasks):
+Core algorithm:
   1. Split video into overlapping windows, sample N frames per window
-  2. Send frames to VLM with SOP context → detect transitions per window
+  2. Send frames to VLM → detect transitions per window
   3. Cluster transitions across windows using Hanning-weighted voting
-  4. Snap final cut points to IMU acceleration valleys (FusionX enhancement)
-  5. Assemble segments with SOP step labels
+  4. Assemble segments with step labels
 
-Usage:
-  python segment_v2t.py                           # Process all episodes
-  python segment_v2t.py --task waterpour           # Process only waterpour tasks
-  python segment_v2t.py --episode waterpour1       # Process single episode
-  python segment_v2t.py --preview                  # Generate preview videos
-  python segment_v2t.py --dry-run                  # Show plan without VLM calls
+Public API:
+  from operators.caption.segment_v2t import segment
+  result = segment("video.mp4")
+
+CLI usage:
+  python segment_v2t.py video.mp4                  # Process a single video
+  python segment_v2t.py a.mp4 b.mp4                # Process multiple videos
+  python segment_v2t.py video.mp4 --preview        # Generate preview video
+  python segment_v2t.py video.mp4 --dry-run        # Show plan without VLM calls
 """
 
 import base64
@@ -30,8 +32,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pandas as pd
-from scipy.signal import savgol_filter, find_peaks
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -39,35 +39,17 @@ logging.getLogger("dashscope").setLevel(logging.CRITICAL)
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(__file__).parent
-DATA_ROOT = SCRIPT_DIR / "FusionX-Multimodal-Sample-Data-V2"
-SOP_DIR = SCRIPT_DIR / "sop"
-
-# Task name → SOP file mapping (derived from episode directory prefix)
-TASK_SOP_MAP = {
-    "box_cut": "box_cut.json",
-    "drill": "drill.json",
-    "screwunscrew": "screwunscrew.json",
-    "syringe": "syringe.json",
-    "waterpour": "waterpour.json",
-}
 
 # ── VLM Config ───────────────────────────────────────────────────────────────
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-13a4a1a0b4464373a339681a07fe121e")
+API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 MODEL = "qwen3.5-plus"
 
-# ── Windowing Config (from video2tasks) ──────────────────────────────────────
+# ── Windowing Config ─────────────────────────────────────────────────────────
 WINDOW_SEC = 10.0          # Window duration in seconds
 STEP_SEC = 5.0             # Step between windows (overlap = window - step)
 FRAMES_PER_WINDOW = 12     # Number of frames sampled per window
 TARGET_W = 640             # Resize width for VLM
 TARGET_H = 480             # Resize height for VLM
-
-# ── IMU Config ───────────────────────────────────────────────────────────────
-SMOOTH_WINDOW = 31
-SMOOTH_POLYORDER = 3
-VALLEY_DISTANCE = 15
-VALLEY_PROMINENCE = 0.3
-SNAP_RADIUS_FRAMES = 45
 
 # ── Segmentation Config ─────────────────────────────────────────────────────
 MIN_SEGMENT_SEC = 0.8      # Minimum segment duration
@@ -80,7 +62,7 @@ OUTPUT_SUFFIX = "v2t"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Windowing (adapted from video2tasks/src/video2tasks/server/windowing.py)
+# Windowing
 # ═══════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -117,35 +99,11 @@ def build_windows(fps: float, nframes: int) -> list[Window]:
     return windows
 
 
-def _get_video_rotation(video_path: str) -> int:
-    """Detect video rotation from metadata using ffprobe. Returns degrees (0, 90, 180, 270)."""
-    import subprocess
-    try:
-        out = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
-             "-show_entries", "stream_tags=rotate", "-of", "csv=p=0", video_path],
-            capture_output=True, text=True, timeout=5,
-        )
-        rot = int(out.stdout.strip()) if out.stdout.strip() else 0
-        return rot % 360
-    except Exception:
-        return 0
-
-
-def _apply_rotation(frame: np.ndarray, rotation: int) -> np.ndarray:
-    """Rotate frame to correct orientation based on metadata rotation."""
-    if rotation == 180:
-        return cv2.rotate(frame, cv2.ROTATE_180)
-    elif rotation == 90:
-        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-    elif rotation == 270:
-        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
-    return frame
-
-
 def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
     """Extract specific frames from video as base64-encoded JPG strings."""
-    rotation = _get_video_rotation(video_path)
+    from ..video_utils import get_manual_rotation, apply_rotation
+
+    rotation = get_manual_rotation(video_path)
     cap = cv2.VideoCapture(video_path)
     results = []
     for fid in sorted(set(frame_ids)):
@@ -153,7 +111,7 @@ def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
         ret, frame = cap.read()
         if not ret:
             continue
-        frame = _apply_rotation(frame, rotation)
+        frame = apply_rotation(frame, rotation)
         frame = cv2.resize(frame, (TARGET_W, TARGET_H))
         _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         results.append(base64.b64encode(buf).decode("ascii"))
@@ -163,7 +121,9 @@ def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
 
 def save_frames_as_tmp_jpg(video_path: str, frame_ids: list[int], tmp_dir: str) -> list[str]:
     """Extract frames and save as temporary JPG files. Returns file paths."""
-    rotation = _get_video_rotation(video_path)
+    from ..video_utils import get_manual_rotation, apply_rotation
+
+    rotation = get_manual_rotation(video_path)
     cap = cv2.VideoCapture(video_path)
     paths = []
     for i, fid in enumerate(sorted(set(frame_ids))):
@@ -171,7 +131,7 @@ def save_frames_as_tmp_jpg(video_path: str, frame_ids: list[int], tmp_dir: str) 
         ret, frame = cap.read()
         if not ret:
             continue
-        frame = _apply_rotation(frame, rotation)
+        frame = apply_rotation(frame, rotation)
         frame = cv2.resize(frame, (TARGET_W, TARGET_H))
         path = os.path.join(tmp_dir, f"frame_{i:03d}.jpg")
         cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -180,60 +140,20 @@ def save_frames_as_tmp_jpg(video_path: str, frame_ids: list[int], tmp_dir: str) 
     return paths
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# IMU Valley Detection (from FusionX experiments)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def find_imu_valleys(episode_dir: Path) -> np.ndarray | None:
-    """Find IMU acceleration valleys as candidate boundaries.
-
-    Returns valley frame indices, or None if no IMU data available.
-    """
-    parquet_path = episode_dir / "frames.parquet"
-    if not parquet_path.exists():
-        return None
-
-    try:
-        df = pd.read_parquet(parquet_path, columns=["lh_imu_accel", "rh_imu_accel"])
-        lh = np.stack(df["lh_imu_accel"].values)
-        rh = np.stack(df["rh_imu_accel"].values)
-        lh_dynamic = lh - lh.mean(axis=0)
-        rh_dynamic = rh - rh.mean(axis=0)
-        accel_mag = np.linalg.norm(lh_dynamic, axis=1) + np.linalg.norm(rh_dynamic, axis=1)
-
-        n = len(accel_mag)
-        win = min(SMOOTH_WINDOW, n if n % 2 == 1 else n - 1)
-        smooth = savgol_filter(accel_mag, window_length=win, polyorder=SMOOTH_POLYORDER)
-        valleys, _ = find_peaks(-smooth, distance=VALLEY_DISTANCE, prominence=VALLEY_PROMINENCE)
-        log.info(f"  IMU: {len(valleys)} valleys detected")
-        return valleys
-    except Exception as e:
-        log.warning(f"  IMU read failed: {e}")
-        return None
-
-
-def snap_to_valley(frame: int, valleys: np.ndarray | None, radius: int = SNAP_RADIUS_FRAMES) -> int:
-    """Snap a frame to the nearest IMU valley within radius."""
-    if valleys is None or len(valleys) == 0:
-        return frame
-    distances = np.abs(valleys - frame)
-    nearest_idx = np.argmin(distances)
-    if distances[nearest_idx] <= radius:
-        return int(valleys[nearest_idx])
-    return frame
-
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # VLM Prompt & Inference
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_window_prompt(sop: dict, n_images: int, window: Window, fps: float) -> str:
-    """Build prompt for a single window — no SOP info, pure visual analysis."""
+def build_window_prompt(n_images: int, window: Window, fps: float, task_name: str | None = None) -> str:
+    """Build prompt for a single window."""
     t_start = window.start_frame / fps
     t_end = window.end_frame / fps
 
+    task_desc = f" of a manual task: {task_name}" if task_name else " of a manual task"
+
     return f"""\
-You are analyzing a segment of an egocentric video of a manual task.
+You are analyzing a segment of an egocentric video{task_desc}.
 This segment covers time {t_start:.1f}s to {t_end:.1f}s of the full video.
 You are given {n_images} frames sampled evenly from this segment.
 
@@ -258,7 +178,7 @@ Note: len(instructions) should be len(transitions) + 1.
 If transitions is empty, instructions should have exactly 1 element describing the whole segment."""
 
 
-def vlm_analyze_window(video_path: str, window: Window, sop: dict, fps: float) -> dict | None:
+def vlm_analyze_window(video_path: str, window: Window, fps: float, task_name: str | None = None) -> dict | None:
     """Send window frames to VLM, get transition analysis."""
     from dashscope import MultiModalConversation
 
@@ -267,7 +187,7 @@ def vlm_analyze_window(video_path: str, window: Window, sop: dict, fps: float) -
         if not frame_paths:
             return None
 
-        prompt = build_window_prompt(sop, len(frame_paths), window, fps)
+        prompt = build_window_prompt(len(frame_paths), window, fps, task_name)
 
         content = [{"image": f"file://{p}"} for p in frame_paths]
         content.append({"text": prompt})
@@ -308,7 +228,7 @@ def vlm_analyze_window(video_path: str, window: Window, sop: dict, fps: float) -
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Cut Clustering (from video2tasks/src/video2tasks/server/windowing.py)
+# Cut Clustering
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def build_segments_via_cuts(
@@ -316,8 +236,7 @@ def build_segments_via_cuts(
     window_results: list[dict | None],
     fps: float,
     nframes: int,
-    sop: dict,
-    valleys: np.ndarray | None,
+    task_name: str | None = None,
 ) -> list[dict]:
     """Cluster per-window transitions into final segments using Hanning weighting."""
     n_windows = len(windows)
@@ -359,14 +278,13 @@ def build_segments_via_cuts(
 
     if not raw_cuts:
         # No transitions detected → single segment
-        instruction = sop["task_name"]
+        instruction = task_name or "Full video"
         if window_instructions:
             instruction = window_instructions[0][2]
         return [{
             "step": 1,
             "frame_interval": [0, nframes],
             "instruction": instruction,
-            "sop_step_index": 1,
             "confidence": 1.0,
         }]
 
@@ -389,8 +307,6 @@ def build_segments_via_cuts(
     for cluster in clusters:
         total_w = sum(w for _, w in cluster)
         avg_frame = int(sum(f * w for f, w in cluster) / total_w)
-        # Snap to IMU valley
-        avg_frame = snap_to_valley(avg_frame, valleys)
         cut_points.append(avg_frame)
 
     # Deduplicate and sort
@@ -431,13 +347,10 @@ def build_segments_via_cuts(
         else:
             instruction = f"Step {i + 1}"
 
-        sop_step_index = i + 1
-
         segments.append({
             "step": i,
             "frame_interval": [seg_start, seg_end],
             "instruction": instruction,
-            "sop_step_index": sop_step_index,
             "confidence": min(1.0, len([c for c in clusters if i < len(clusters)]) / n_windows) if clusters else 0.5,
         })
 
@@ -445,88 +358,52 @@ def build_segments_via_cuts(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Episode Discovery & Processing
+# Video Processing
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def get_task_type(episode_name: str) -> str | None:
-    """Extract task type from episode name (e.g., 'waterpour1' → 'waterpour')."""
-    for task in TASK_SOP_MAP:
-        if episode_name.startswith(task):
-            return task
-    return None
+def segment(
+    video_path: str | Path,
+    *,
+    task_name: str | None = None,
+    window_sec: float = WINDOW_SEC,
+    step_sec: float = STEP_SEC,
+    frames_per_window: int = FRAMES_PER_WINDOW,
+) -> dict:
+    """Segment a video into atomic actions. This is the public API.
 
+    Args:
+        video_path: Path to the mp4 video file.
+        task_name: Optional task description to provide context to the VLM
+                   (e.g. "water pouring", "screw assembly").
+        window_sec: Sliding window duration in seconds.
+        step_sec: Step between windows in seconds.
+        frames_per_window: Number of frames sampled per window.
 
-def discover_episodes(
-    task_filter: str | None = None,
-    episode_filter: str | None = None,
-    sop_override: dict | None = None,
-) -> list[tuple[Path, dict | None]]:
-    """Discover episodes and optionally load their SOPs.
-
-    Returns list of (episode_dir, sop_dict_or_None).
-    When *sop_override* is given, every discovered episode uses that SOP.
-    Otherwise the function tries to resolve SOP from the episode name prefix;
-    episodes without a matching SOP are still included (sop=None).
+    Returns:
+        dict with keys:
+          - video: filename
+          - fps: video frame rate
+          - nframes: total frame count
+          - method: "v2t_windowing"
+          - atomic_action: list of {frame_interval: [start, end], instruction: str}
     """
-    episodes = []
-    for ep_dir in sorted(DATA_ROOT.iterdir()):
-        if not ep_dir.is_dir():
-            continue
-        if not (ep_dir / "rgb.mp4").exists():
-            continue
+    video_path = Path(video_path).resolve()
+    if not video_path.exists():
+        raise FileNotFoundError(f"Video not found: {video_path}")
 
-        name = ep_dir.name
-
-        if episode_filter and name != episode_filter:
-            continue
-
-        # Resolve SOP: explicit override > name-prefix lookup > None
-        if sop_override is not None:
-            sop = sop_override
-        else:
-            task_type = get_task_type(name)
-            if task_filter and (task_type is None or task_type != task_filter):
-                continue
-            if task_type and (SOP_DIR / TASK_SOP_MAP[task_type]).exists():
-                sop = json.loads((SOP_DIR / TASK_SOP_MAP[task_type]).read_text())
-            else:
-                sop = None
-
-        episodes.append((ep_dir, sop))
-
-    return episodes
-
-
-def process_episode(episode_dir: Path, sop: dict | None, preview: bool = False, dry_run: bool = False) -> dict | None:
-    """Process a single episode: window → VLM → cluster → snap → output."""
-    name = episode_dir.name
-    rgb_path = str(episode_dir / "rgb.mp4")
-
-    # Build a minimal SOP stub when none is provided
-    if sop is None:
-        sop = {"task_name": name, "steps": []}
+    name = video_path.stem
 
     # Get video info
-    cap = cv2.VideoCapture(rgb_path)
+    cap = cv2.VideoCapture(str(video_path))
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
 
-    duration = nframes / fps
-    log.info(f"[{name}] {nframes} frames, {fps:.0f} fps, {duration:.1f}s, task: {sop['task_name']}")
+    log.info(f"[{name}] {nframes} frames, {fps:.0f} fps, {nframes / fps:.1f}s")
 
     # Build windows
     windows = build_windows(fps, nframes)
-    log.info(f"[{name}] {len(windows)} windows (window={WINDOW_SEC}s, step={STEP_SEC}s, {FRAMES_PER_WINDOW} frames/win)")
-
-    if dry_run:
-        for w in windows:
-            log.info(f"  Window {w.window_id}: frames [{w.start_frame}, {w.end_frame}] "
-                     f"({(w.end_frame - w.start_frame) / fps:.1f}s), {len(w.frame_ids)} samples")
-        return None
-
-    # Find IMU valleys
-    valleys = find_imu_valleys(episode_dir)
+    log.info(f"[{name}] {len(windows)} windows (window={window_sec}s, step={step_sec}s, {frames_per_window} frames/win)")
 
     # Analyze all windows with VLM in parallel
     log.info(f"[{name}] Analyzing {len(windows)} windows in parallel...")
@@ -536,7 +413,7 @@ def process_episode(episode_dir: Path, sop: dict | None, preview: bool = False, 
         idx, w = idx_win
         log.info(f"[{name}] Window {w.window_id}/{len(windows)-1} "
                  f"[{w.start_frame}-{w.end_frame}] ({(w.end_frame-w.start_frame)/fps:.1f}s)")
-        result = vlm_analyze_window(rgb_path, w, sop, fps)
+        result = vlm_analyze_window(str(video_path), w, fps, task_name)
         if result:
             log.info(f"[{name}] Window {w.window_id} → {len(result.get('transitions', []))} transitions")
         else:
@@ -548,43 +425,62 @@ def process_episode(episode_dir: Path, sop: dict | None, preview: bool = False, 
             window_results[idx] = result
 
     # Build segments via cut clustering
-    segments = build_segments_via_cuts(windows, window_results, fps, nframes, sop, valleys)
+    segments = build_segments_via_cuts(windows, window_results, fps, nframes, task_name)
 
-    # Build output caption
-    task_type = get_task_type(name)
-    sop_file = str(Path("sop") / TASK_SOP_MAP[task_type]) if task_type else None
-    caption = {
-        "instruction": sop["task_name"],
-        "sop_file": sop_file,
+    return {
+        "video": video_path.name,
+        "fps": fps,
+        "nframes": nframes,
         "method": "v2t_windowing",
         "atomic_action": [
             {
                 "frame_interval": seg["frame_interval"],
                 "instruction": seg["instruction"],
-                "sop_step_index": seg["sop_step_index"],
             }
             for seg in segments
         ],
     }
 
+
+def process_video(video_path: Path, preview: bool = False, dry_run: bool = False, task_name: str | None = None) -> dict | None:
+    """Process a single video file with file I/O and optional preview. Used by CLI."""
+    video_path = Path(video_path).resolve()
+    name = video_path.stem
+
+    if dry_run:
+        cap = cv2.VideoCapture(str(video_path))
+        nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+        windows = build_windows(fps, nframes)
+        log.info(f"[{name}] {nframes} frames, {fps:.0f} fps, {nframes / fps:.1f}s")
+        log.info(f"[{name}] {len(windows)} windows")
+        for w in windows:
+            log.info(f"  Window {w.window_id}: frames [{w.start_frame}, {w.end_frame}] "
+                     f"({(w.end_frame - w.start_frame) / fps:.1f}s), {len(w.frame_ids)} samples")
+        return None
+
+    caption = segment(video_path, task_name=task_name)
+    fps = caption["fps"]
+
     # Save
-    out_path = episode_dir / f"caption_{OUTPUT_SUFFIX}.json"
+    out_path = video_path.parent / f"caption_{OUTPUT_SUFFIX}.json"
     out_path.write_text(json.dumps(caption, ensure_ascii=False, indent=2))
     log.info(f"[{name}] Saved: {out_path}")
 
     # Print summary
     print(f"\n{'─' * 60}")
-    print(f"  {name}: {caption['instruction']}")
+    print(f"  {name}")
     print(f"  Segments: {len(caption['atomic_action'])}")
-    for a in caption["atomic_action"]:
+    for i, a in enumerate(caption["atomic_action"]):
         s, e = a["frame_interval"]
         dur = (e - s) / fps
-        print(f"    Step {a['sop_step_index']}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['instruction']}")
+        print(f"    Step {i + 1}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['instruction']}")
     print(f"{'─' * 60}")
 
     # Preview
     if preview:
-        preview_path = generate_preview(episode_dir, caption, fps)
+        preview_path = generate_preview(video_path, caption, fps)
         log.info(f"[{name}] Preview: {preview_path}")
 
     return caption
@@ -597,13 +493,21 @@ def process_episode(episode_dir: Path, sop: dict | None, preview: bool = False, 
 PREVIEW_W = 640  # Preview output width (height auto-scaled)
 
 
-def generate_preview(episode_dir: Path, caption: dict, fps: float) -> Path:
+def generate_preview(video_path: Path, caption: dict, fps: float) -> Path:
     """Generate preview video with subtitle overlay, rotation correction, and 640p downscale."""
-    rgb_path = str(episode_dir / "rgb.mp4")
-    out_path = episode_dir / f"preview_caption_{OUTPUT_SUFFIX}.mp4"
-    tmp_path = episode_dir / f"preview_caption_{OUTPUT_SUFFIX}.tmp.mp4"
+    rgb_path = str(video_path)
+    out_dir = video_path.parent
+    out_path = out_dir / f"preview_caption_{OUTPUT_SUFFIX}.mp4"
+    tmp_path = out_dir / f"preview_caption_{OUTPUT_SUFFIX}.tmp.mp4"
 
-    rotation = _get_video_rotation(rgb_path)
+    try:
+        from ..video_utils import get_manual_rotation, apply_rotation as _apply_rot
+    except ImportError:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from video_utils import get_manual_rotation, apply_rotation as _apply_rot
+
+    rotation = get_manual_rotation(rgb_path)
     cap = cv2.VideoCapture(rgb_path)
     W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -628,12 +532,13 @@ def generate_preview(episode_dir: Path, caption: dict, fps: float) -> Path:
         ret, frame = cap.read()
         if not ret:
             break
-        frame = _apply_rotation(frame, rotation)
+        frame = _apply_rot(frame, rotation)
         frame = cv2.resize(frame, (out_w, out_h))
         for a in actions:
             s, e = a["frame_interval"]
             if s <= fidx < e:
-                text = f"[Step {a.get('sop_step_index', '?')}] {a['instruction']}"
+                step_idx = actions.index(a) + 1
+                text = f"[Step {step_idx}] {a['instruction']}"
                 frame = _render_subtitle(frame, text)
                 break
         writer.write(frame)
@@ -818,18 +723,14 @@ def _render_subtitle(frame: np.ndarray, text: str) -> np.ndarray:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
-    global WINDOW_SEC, STEP_SEC, FRAMES_PER_WINDOW, SNAP_RADIUS_FRAMES
+    global WINDOW_SEC, STEP_SEC, FRAMES_PER_WINDOW
     import argparse
 
-    p = argparse.ArgumentParser(description="Video segmentation using video2tasks windowing approach")
-    p.add_argument("--data-root", type=str, default=None,
-                   help=f"Data directory containing episode folders (default: {DATA_ROOT})")
-    p.add_argument("--sop", type=str, default=None,
-                   help="Path to SOP JSON file (applies to all episodes; omit for auto-detect or no-SOP mode)")
-    p.add_argument("--task", type=str, default=None,
-                   help="Filter by task type (waterpour, box_cut, drill, screwunscrew, syringe)")
-    p.add_argument("--episode", type=str, default=None,
-                   help="Process single episode by name (e.g., waterpour1)")
+    p = argparse.ArgumentParser(description="Video segmentation via VLM sliding-window analysis")
+    p.add_argument("videos", nargs="+", type=str,
+                   help="Path(s) to mp4 video file(s)")
+    p.add_argument("--task-name", type=str, default=None,
+                   help="Optional task description for VLM context (e.g. 'water pouring')")
     p.add_argument("--preview", action="store_true",
                    help="Generate preview videos with subtitle overlay")
     p.add_argument("--dry-run", action="store_true",
@@ -840,58 +741,52 @@ def main():
                    help=f"Step between windows in seconds (default: {STEP_SEC})")
     p.add_argument("--frames-per-window", type=int, default=FRAMES_PER_WINDOW,
                    help=f"Frames sampled per window (default: {FRAMES_PER_WINDOW})")
-    p.add_argument("--snap-radius", type=int, default=SNAP_RADIUS_FRAMES,
-                   help=f"IMU valley snap radius in frames (default: {SNAP_RADIUS_FRAMES})")
     args = p.parse_args()
 
     # Apply config overrides
     WINDOW_SEC = args.window_sec
     STEP_SEC = args.step_sec
     FRAMES_PER_WINDOW = args.frames_per_window
-    SNAP_RADIUS_FRAMES = args.snap_radius
 
-    if args.data_root:
-        DATA_ROOT = Path(args.data_root)
+    # Validate input files
+    video_paths = []
+    for v in args.videos:
+        vp = Path(v)
+        if not vp.exists():
+            log.error(f"Video file not found: {vp}")
+            continue
+        if not vp.suffix.lower() == ".mp4":
+            log.warning(f"Skipping non-mp4 file: {vp}")
+            continue
+        video_paths.append(vp)
 
-    # Load explicit SOP if provided
-    sop_override = None
-    if args.sop:
-        sop_path = Path(args.sop)
-        if not sop_path.exists():
-            log.error(f"SOP file not found: {sop_path}")
-            return
-        sop_override = json.loads(sop_path.read_text(encoding="utf-8"))
-
-    # Discover episodes
-    episodes = discover_episodes(task_filter=args.task, episode_filter=args.episode, sop_override=sop_override)
-    if not episodes:
-        log.error("No episodes found. Check --task or --episode filter.")
+    if not video_paths:
+        log.error("No valid mp4 files provided.")
         return
 
-    log.info(f"Found {len(episodes)} episode(s) to process")
+    log.info(f"Processing {len(video_paths)} video(s)")
 
-    # Process episodes in parallel
+    # Process videos
     results = {}
 
-    def _process(ep_sop):
-        ep_dir, sop = ep_sop
+    def _process(vp):
         try:
-            caption = process_episode(ep_dir, sop, preview=args.preview, dry_run=args.dry_run)
-            return ep_dir.name, caption
+            caption = process_video(vp, preview=args.preview, dry_run=args.dry_run, task_name=args.task_name)
+            return vp.stem, caption
         except Exception as e:
-            log.error(f"[{ep_dir.name}] Failed: {e}", exc_info=True)
-            return ep_dir.name, None
+            log.error(f"[{vp.stem}] Failed: {e}", exc_info=True)
+            return vp.stem, None
 
-    max_episodes = min(4, len(episodes))  # Cap episode-level concurrency
-    with ThreadPoolExecutor(max_workers=max_episodes) as pool:
-        for name, caption in pool.map(_process, episodes):
+    max_workers = min(4, len(video_paths))
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for name, caption in pool.map(_process, video_paths):
             if caption:
                 results[name] = caption
 
     # Summary
     if results:
         print(f"\n{'═' * 60}")
-        print(f"  Processed {len(results)} episodes")
+        print(f"  Processed {len(results)} video(s)")
         print(f"  VLM calls: {_token_stats['calls']}")
         print(f"  Tokens: {_token_stats['input_tokens']} in / {_token_stats['output_tokens']} out")
         print(f"{'═' * 60}")

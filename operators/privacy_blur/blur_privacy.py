@@ -167,14 +167,38 @@ def _detect_frame(
 # ── video probe ─────────────────────────────────────────────────────
 
 
-# Source codec → ffmpeg encoder mapping
-_ENCODER_MAP = {
+# Source codec → preferred encoder.
+# GPU (NVENC) is tried first; if unavailable, falls back to CPU encoder.
+_ENCODER_MAP_GPU = {
+    "h264": "h264_nvenc",
+    "hevc": "hevc_nvenc",
+    "h265": "hevc_nvenc",
+}
+_ENCODER_MAP_CPU = {
     "h264": "libx264",
     "hevc": "libx265",
     "h265": "libx265",
     "vp9": "libvpx-vp9",
     "av1": "libsvtav1",
 }
+
+def _nvenc_available() -> bool:
+    """Quick check: probe a 1-frame null encode with hevc_nvenc.
+
+    NVENC requires minimum ~145x97 resolution; use 256x256 for the probe.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(
+            ["ffmpeg", "-hide_banner", "-f", "lavfi", "-i", "nullsrc=s=256x256:d=0.1",
+             "-frames:v", "1", "-c:v", "hevc_nvenc", "-f", "null", "-"],
+            capture_output=True, timeout=5,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
+_USE_NVENC: bool | None = None  # lazy init
 
 
 def _probe_video(path: str) -> dict:
@@ -208,8 +232,26 @@ def _build_ffmpeg_cmd(
     fps: float,
     src: dict,
 ) -> list[str]:
-    """Build ffmpeg command that matches original video encoding config."""
-    encoder = _ENCODER_MAP.get(src["codec"], "libx264")
+    """Build ffmpeg command that matches original video encoding config.
+
+    Prefers NVENC GPU encoding when available; falls back to CPU encoders.
+    """
+    global _USE_NVENC
+    if _USE_NVENC is None:
+        _USE_NVENC = _nvenc_available()
+        import logging as _log
+        _log.getLogger(__name__).info(
+            f"NVENC GPU encoding: {'enabled' if _USE_NVENC else 'unavailable, using CPU'}"
+        )
+
+    codec = src["codec"]
+    if _USE_NVENC and codec in _ENCODER_MAP_GPU:
+        encoder = _ENCODER_MAP_GPU[codec]
+        use_gpu = True
+    else:
+        encoder = _ENCODER_MAP_CPU.get(codec, "libx264")
+        use_gpu = False
+
     pix_fmt = src["pix_fmt"] or "yuv420p"
     bitrate = src["bitrate"]
 
@@ -224,19 +266,26 @@ def _build_ffmpeg_cmd(
         "-pix_fmt", pix_fmt,
     ]
 
-    # Use original bitrate with high-quality preset for near-identical output
-    if bitrate > 0:
-        cmd += ["-b:v", str(bitrate)]
-        if encoder == "libx264":
-            cmd += ["-preset", "veryfast", "-profile:v", "high"]
-        elif encoder == "libx265":
-            cmd += ["-preset", "veryfast", "-profile:v", "main"]
+    if use_gpu:
+        # NVENC: use CBR with target bitrate, or high-quality VBR
+        if bitrate > 0:
+            cmd += ["-b:v", str(bitrate), "-maxrate:v", str(int(bitrate * 1.5)),
+                    "-bufsize:v", str(bitrate * 2)]
+        else:
+            cmd += ["-cq", "18", "-preset", "p4"]  # NVENC quality preset
     else:
-        # Fallback: visually lossless CRF
-        if encoder == "libx264":
-            cmd += ["-crf", "17", "-preset", "veryfast"]
-        elif encoder == "libx265":
-            cmd += ["-crf", "18", "-preset", "veryfast"]
+        # CPU encoders
+        if bitrate > 0:
+            cmd += ["-b:v", str(bitrate)]
+            if encoder == "libx264":
+                cmd += ["-preset", "veryfast", "-profile:v", "high"]
+            elif encoder == "libx265":
+                cmd += ["-preset", "veryfast", "-profile:v", "main"]
+        else:
+            if encoder == "libx264":
+                cmd += ["-crf", "17", "-preset", "veryfast"]
+            elif encoder == "libx265":
+                cmd += ["-crf", "18", "-preset", "veryfast"]
 
     cmd.append(output_path)
     return cmd

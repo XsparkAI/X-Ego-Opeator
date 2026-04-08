@@ -8,12 +8,17 @@
 # 数据集目录（Episode）必须包含名为 rgb.mp4 的输入视频文件。
 
 # ── 数据集源（Episode）配置 ───────────────────────────────────────────
-# 选项 1：明确指定数据集目录列表（支持单个路径或列表）
-episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic/episode2"
+# 选项 1：明确指定数据集目录列表（支持单个路径或列表,包含 rgb.mp4）
+episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/test_episode_10s"
 
 # 选项 2：自动扫描根目录下的所有数据集目录
 # （包含 rgb.mp4 文件的子目录将被视为一个独立的数据集）
 # episode_root: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic"
+
+# ── VLM API 配置 ─────────────────────────────────────────────────── 
+# 用于 video_segmentation 和 hand_analysis(method=vlm) 等 VLM 算子。
+# 也可通过环境变量 DASHSCOPE_API_KEY 设置（环境变量优先）。
+dashscope_api_key: ""
 
 # ── 执行模式 ────────────────────────────────────────────────────────
 # parallel: true  — 无依赖关系的算子将并发执行
@@ -24,26 +29,66 @@ parallel: true
 # "fail_fast"  — 遇到首个算子失败时立即终止整个流水线
 on_error: continue
 
+# 多 episode 执行策略：
+#   "sequential" — 逐个 episode 串行处理（默认）
+#   "pipeline"   — 流水线模式：各依赖阶段拥有独立工作线程池，
+#                  episode 在阶段间流转，不同 episode 的不同阶段可重叠执行。
+#                  适用于多 episode 批量处理，可显著提升吞吐量。
+execution_mode: pipeline
+
+# 流水线模式下每阶段的工作线程数（仅 execution_mode=pipeline 时生效）。
+# 列表长度应等于依赖阶段数。默认每阶段 1 个 worker。
+# 当前默认 3 阶段：
+#   Stage 1 (video_quality + hand_analysis)   — CPU/GPU 混合
+#   Stage 2 (privacy_blur)                    — GPU 密集
+#   Stage 3 (transcode, 如已启用)             — CPU 密集
+# 建议按算子耗时比例分配，如 privacy_blur 耗时最长可分配更多 worker。
+stage_workers: [4, 3, 2]
+
 # ── 算子配置 ────────────────────────────────────────────────────────
 # 算子执行顺序固定如下：
-#   1. video_quality      — 评估原始视频质量
-#   2. hand_detection     — 视频中的手部检测
-#   3. privacy_blur       — 模糊人脸与车牌（隐私保护）
-#   4. transcode          — 视频格式转码
-#   5. video_segmentation — 基于视觉大模型（VLM）将视频分割为任务步骤
+#   1. video_segmentation — 基于 VLM 将视频分割为任务步骤（输出 caption_v2t.json）
+#   2. segment_cut        — 按分割结果裁剪短视频（减少后续 I/O 压力）
+#   3. video_quality      — 评估视频质量（在短片段上运行）
+#   4. hand_analysis      — 手部分析（method: yolo 逐帧检测 | vlm 语义分析）
+#   5. privacy_blur       — 模糊人脸与车牌（隐私保护）
+#   6. transcode          — 视频格式转码
 #
 # 将 enabled 设为 false 可跳过对应算子。
 # 若完全省略某个算子配置块，则使用默认值（即 enabled: true）。
+#
+# 启用 video_segmentation + segment_cut 后，后续算子将对每个裁剪片段
+# 独立运行（fan-out 模式），大幅减少长视频的解码开销。
 
 operators:
-  video_quality:
-    enabled: false
-    sample_fps: 2.0          # 抽帧频率（帧/秒）。设为 null 则处理所有帧
+  video_segmentation:
+    enabled: true            # VLM 分段标注
+    window_sec: 10.0
+    step_sec: 5.0
+    frames_per_window: 8     
 
-  hand_detection:
-    enabled: false
+  segment_cut:
+    enabled: true            # 按标注裁剪短视频
+    min_duration_sec: 0.5    # 跳过短于此秒数的片段
+
+  video_quality:
+    enabled: true
+    sample_fps: 2.0          # 抽帧频率（帧/秒）。设为 null 则处理所有帧
+    # 子算子开关 — 可按需关闭不适用的检测项
+    # 例如频繁场景变化的数据可关闭 stability 检测
+    check_quality: true      # 画面质量检测（模糊帧）
+    check_stability: true    # 视频稳定性检测（抖动帧）
+    check_exposure: true     # 曝光与光照检测（过曝/欠曝帧）
+
+  hand_analysis:
+    enabled: true
+    # method: 手部检测后端，二选一
+    #   "yolo" — YOLO 逐帧检测，速度快，输出 bbox + 置信度（默认）
+    #   "vlm"  — VLM 语义分析，能区分拍摄者/他人手部、检测遮挡，但依赖 API
+    method: vlm
+    frame_step: 120            # 步长：每隔 N 帧处理一次（1=逐帧，VLM 建议 ≥150）
+    # ── YOLO 专用参数（仅 method=yolo 时生效）──
     conf_thresh: 0.3         # YOLO 检测置信度阈值
-    frame_step: 1            # 步长：每隔 N 帧处理一次（1 表示逐帧处理）
     input_height: 720        # 检测前的图像缩放高度
 
   privacy_blur:
@@ -59,6 +104,3 @@ operators:
     # bitrate: 50M           # 目标码率（设置后启用有损压缩模式）
     # fps: 30.0              # 目标帧率
     # output_suffix: _transcoded  # 输出文件名后缀
-
-  video_segmentation:
-    enabled: false           # 默认关闭（运行需配置 DASHSCOPE_API_KEY 环境变量）

@@ -54,7 +54,7 @@ TASK_SOP_MAP = {
 }
 
 # ── VLM Config ───────────────────────────────────────────────────────────────
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "sk-13a4a1a0b4464373a339681a07fe121e")
+API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
 MODEL = "qwen3.5-plus"
 
 # ── Windowing Config (from video2tasks) ──────────────────────────────────────

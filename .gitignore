@@ -3,3 +3,6 @@ test_video
 tmp/
 *.zip
 **/weights
+CLAUDE.md
+doc/
+.codex

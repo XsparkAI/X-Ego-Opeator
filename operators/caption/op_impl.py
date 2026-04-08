@@ -29,42 +29,45 @@ class SegmentationOperator:
         self.config = config or SegmentationConfig()
 
     def run(self, episode_dir: Path, **kwargs) -> OperatorResult:
-        from . import segment_v2t as seg_module
-        from .segment_v2t import (
-            process_episode, get_task_type, TASK_SOP_MAP, SOP_DIR,
-        )
+        from .segment_v2t import segment
 
-        # Apply config to module globals (matching existing CLI pattern)
-        seg_module.WINDOW_SEC = self.config.window_sec
-        seg_module.STEP_SEC = self.config.step_sec
-        seg_module.FRAMES_PER_WINDOW = self.config.frames_per_window
-        seg_module.SNAP_RADIUS_FRAMES = self.config.snap_radius
+        video_path = episode_dir / "rgb.mp4"
+        output_path = episode_dir / "caption_v2t.json"
 
-        # Resolve SOP: try name-prefix lookup, fall back to None (no-SOP mode)
-        task_type = get_task_type(episode_dir.name)
-        sop = None
-        if task_type:
-            sop_path = SOP_DIR / TASK_SOP_MAP[task_type]
-            if sop_path.exists():
-                sop = json.loads(sop_path.read_text(encoding="utf-8"))
+        if not video_path.exists():
+            return OperatorResult(
+                status="error", operator=self.name,
+                errors=[f"Video not found: {video_path}"],
+            )
 
         try:
-            caption = process_episode(
-                episode_dir, sop,
-                preview=self.config.preview,
-                dry_run=self.config.dry_run,
+            caption = segment(
+                video_path,
+                window_sec=self.config.window_sec,
+                step_sec=self.config.step_sec,
+                frames_per_window=self.config.frames_per_window,
             )
-            output_path = episode_dir / "caption_v2t.json"
-            metrics = {}
-            if caption:
-                segments = caption.get("atomic_action", caption.get("segments", []))
-                metrics["num_segments"] = len(segments)
-                if "token_stats" in caption:
-                    metrics["token_stats"] = caption["token_stats"]
+
+            output_path.write_text(
+                json.dumps(caption, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+
+            segments = caption.get("atomic_action", [])
+            metrics = {"num_segments": len(segments)}
+            output_files = [str(output_path)]
+
+            # Generate caption preview video (full video + subtitle overlay)
+            try:
+                from .segment_v2t import generate_preview
+                preview_path = generate_preview(video_path, caption, caption["fps"])
+                output_files.append(str(preview_path))
+                log.info(f"Caption preview saved: {preview_path}")
+            except Exception as e:
+                log.warning(f"caption preview failed (non-fatal): {e}")
 
             return OperatorResult(
                 status="ok", operator=self.name,
-                output_files=[str(output_path)],
+                output_files=output_files,
                 metrics=metrics,
             )
         except Exception as e:
