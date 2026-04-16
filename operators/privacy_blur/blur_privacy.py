@@ -23,6 +23,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from typing import Any
 
 try:
     from ..video_path import resolve_episode_video_path
@@ -109,6 +110,23 @@ def _build_detectors(
     return face_det, lp_det
 
 
+def _build_yolo_detector(model_path: str | Path):
+    """Initialise an Ultralytics YOLO model for generic bbox-based blurring."""
+    from ultralytics import YOLO
+
+    weights = Path(model_path)
+    if not weights.is_absolute():
+        repo_candidate = PROJECT_ROOT.parent.parent / weights
+        if repo_candidate.exists():
+            weights = repo_candidate
+    if not weights.exists():
+        raise FileNotFoundError(f"YOLO weights not found: {weights}")
+
+    model = YOLO(str(weights))
+    log.info(f"YOLO blur detector loaded from {weights}")
+    return model
+
+
 # ── blur helpers ─────────────────────────────────────────────────────
 
 
@@ -170,6 +188,32 @@ def _detect_frame(
     if lp_det:
         boxes.extend(_extract_boxes(lp_det.run(tensor)))
     return boxes
+
+
+def _detect_frame_yolo(
+    bgr: np.ndarray,
+    model: Any,
+    conf_thresh: float,
+    class_ids: list[int] | None = None,
+    input_size: int | None = None,
+) -> list[list[float]]:
+    """Run YOLO bbox detection on a single BGR frame."""
+    results = model.predict(
+        source=bgr,
+        conf=conf_thresh,
+        classes=class_ids,
+        imgsz=input_size,
+        verbose=False,
+    )
+    if not results:
+        return []
+
+    boxes_result = results[0].boxes
+    if boxes_result is None or len(boxes_result) == 0:
+        return []
+
+    xyxy = boxes_result.xyxy.cpu().numpy()
+    return [[float(v) for v in row.tolist()] for row in xyxy]
 
 
 # ── video probe ─────────────────────────────────────────────────────
@@ -305,13 +349,18 @@ def _build_ffmpeg_cmd(
 def blur_video(
     video_path: Path,
     output_path: Path,
+    detector_backend: str = "egoblur",
     face: bool = True,
     lp: bool = True,
     scale: float = 1.0,
     face_thresh: float | None = None,
     lp_thresh: float | None = None,
+    yolo_model_path: str | Path = "weights/yolo26n.pt",
+    yolo_conf_thresh: float = 0.25,
+    yolo_classes: list[int] | None = None,
+    yolo_input_size: int | None = 960,
     resize: int | None = None,
-    detectors: tuple | None = None,
+    detectors: Any = None,
 ) -> dict:
     """
     Process a video: detect faces/LPs and write blurred output.
@@ -322,18 +371,30 @@ def blur_video(
     Blur is applied on the original resolution frame.
 
     Args:
-        detectors: Optional pre-loaded (face_det, lp_det) tuple to avoid
-                   reloading models on every call.  Must be built with
-                   resize_aug=None.
+        detectors: Optional pre-loaded detector object(s) to avoid reloading
+                   models on every call.
 
     Returns a summary dict with detection stats.
     """
+    backend = str(detector_backend).lower()
     device = _get_device()
-    if detectors is not None:
-        face_det, lp_det = detectors
+    face_det = lp_det = yolo_model = None
+
+    if backend == "egoblur":
+        if detectors is not None:
+            face_det, lp_det = detectors
+        else:
+            face_det, lp_det = _build_detectors(
+                device, face=face, lp=lp, face_thresh=face_thresh, lp_thresh=lp_thresh,
+            )
+    elif backend == "yolo":
+        if detectors is not None:
+            yolo_model = detectors
+        else:
+            yolo_model = _build_yolo_detector(yolo_model_path)
     else:
-        face_det, lp_det = _build_detectors(
-            device, face=face, lp=lp, face_thresh=face_thresh, lp_thresh=lp_thresh,
+        raise ValueError(
+            f"Unsupported detector_backend={detector_backend!r}, expected 'egoblur' or 'yolo'"
         )
 
     cap = cv2.VideoCapture(str(video_path))
@@ -345,26 +406,36 @@ def blur_video(
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    # Compute EgoBlur's exact target resolution and resize externally
-    det_h, det_w = _compute_egoblur_target(frame_h, frame_w)
-    if det_h == frame_h and det_w == frame_w:
+    if backend == "egoblur":
+        # Compute EgoBlur's exact target resolution and resize externally.
+        det_h, det_w = _compute_egoblur_target(frame_h, frame_w)
+        if det_h == frame_h and det_w == frame_w:
+            needs_resize = False
+            scale_back_h = scale_back_w = 1.0
+        else:
+            needs_resize = True
+            scale_back_h = frame_h / det_h
+            scale_back_w = frame_w / det_w
+    else:
+        det_h, det_w = frame_h, frame_w
         needs_resize = False
         scale_back_h = scale_back_w = 1.0
-    else:
-        needs_resize = True
-        scale_back_h = frame_h / det_h
-        scale_back_w = frame_w / det_w
 
     src = _probe_video(str(video_path))
     ffmpeg_cmd = _build_ffmpeg_cmd(str(output_path), frame_w, frame_h, fps, src)
     log.info(f"Source encoding: {src['codec']}, pix_fmt={src['pix_fmt']}, bitrate={src['bitrate'] // 1000}kbps")
     stderr_tmp = tempfile.TemporaryFile()
     writer = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=stderr_tmp)
+    detect_desc = (
+        "exact EgoBlur target, internal resize bypassed"
+        if backend == "egoblur"
+        else f"YOLO imgsz={yolo_input_size or 'native'}"
+    )
 
     log.info(
         f"Processing {video_path.name}: {total_frames} frames, "
         f"{frame_w}x{frame_h} @ {fps:.1f} fps, "
-        f"detect at {det_w}x{det_h} (exact EgoBlur target, internal resize bypassed)"
+        f"detect at {det_w}x{det_h} ({detect_desc})"
     )
 
     frame_idx = 0
@@ -378,16 +449,23 @@ def blur_video(
             if not ret:
                 break
 
-            # resize to exact EgoBlur target via OpenCV (fast, C++ optimised)
             if needs_resize:
                 det_frame = cv2.resize(bgr, (det_w, det_h))
             else:
                 det_frame = bgr
 
-            boxes = _detect_frame(det_frame, face_det, lp_det, device)
+            if backend == "egoblur":
+                boxes = _detect_frame(det_frame, face_det, lp_det, device)
+            else:
+                boxes = _detect_frame_yolo(
+                    det_frame,
+                    yolo_model,
+                    conf_thresh=yolo_conf_thresh,
+                    class_ids=yolo_classes,
+                    input_size=yolo_input_size,
+                )
 
             if boxes:
-                # map boxes back to original resolution
                 if needs_resize:
                     boxes = [
                         [b[0] * scale_back_w, b[1] * scale_back_h,
@@ -430,10 +508,16 @@ def blur_video(
         "throughput_fps": round(frame_idx / elapsed, 2) if elapsed > 0 else 0,
         "detections_total": total_detections,
         "frames_with_detections": frames_with_detections,
+        "detector_backend": backend,
         "blur_face": face,
         "blur_lp": lp,
         "scale_factor": scale,
     }
+    if backend == "yolo":
+        summary["yolo_model_path"] = str(yolo_model_path)
+        summary["yolo_conf_thresh"] = yolo_conf_thresh
+        summary["yolo_classes"] = yolo_classes
+        summary["yolo_input_size"] = yolo_input_size
 
     log.info(
         f"Done: {frame_idx} frames in {elapsed:.1f}s "
@@ -493,8 +577,19 @@ def main():
     group.add_argument("--episode", type=Path, help="Episode directory (reads configured input video)")
     parser.add_argument("--output", type=Path, default=None, help="Output video path (--video mode)")
     parser.add_argument("--scale", type=float, default=1.0, help="Blur region scale factor (default: 1.0)")
+    parser.add_argument("--detector-backend", type=str, default="egoblur", help="Detector backend: egoblur | yolo")
     parser.add_argument("--face-thresh", type=float, default=None, help="Face detection threshold")
     parser.add_argument("--lp-thresh", type=float, default=None, help="LP detection threshold")
+    parser.add_argument("--yolo-model-path", type=str, default="weights/yolo26n.pt", help="YOLO weights path")
+    parser.add_argument("--yolo-conf-thresh", type=float, default=0.25, help="YOLO detection threshold")
+    parser.add_argument(
+        "--yolo-classes",
+        type=int,
+        nargs="*",
+        default=None,
+        help="Optional YOLO class ids to blur, e.g. --yolo-classes 0 2 7",
+    )
+    parser.add_argument("--yolo-input-size", type=int, default=960, help="YOLO imgsz")
     parser.add_argument("--preview", action="store_true", help="Generate side-by-side preview")
     args = parser.parse_args()
 
@@ -509,8 +604,15 @@ def main():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     summary = blur_video(
-        video_path, output_path, scale=args.scale,
+        video_path,
+        output_path,
+        detector_backend=args.detector_backend,
+        scale=args.scale,
         face_thresh=args.face_thresh, lp_thresh=args.lp_thresh,
+        yolo_model_path=args.yolo_model_path,
+        yolo_conf_thresh=args.yolo_conf_thresh,
+        yolo_classes=args.yolo_classes,
+        yolo_input_size=args.yolo_input_size,
     )
 
     if args.preview:

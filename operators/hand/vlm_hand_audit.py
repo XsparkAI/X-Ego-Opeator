@@ -78,11 +78,11 @@ def sample_frames(video_path: str, frame_step: int) -> tuple[list[int], float, i
 
 def extract_frames_to_dir(video_path: str, frame_ids: list[int], tmp_dir: str) -> list[str]:
     try:
-        from ..frame_cache.cache_utils import get_cached_frame_paths
+        from ..frame_cache.cache_utils import ensure_cached_frame_paths
     except ImportError:
         import sys as _sys
         _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from frame_cache.cache_utils import get_cached_frame_paths
+        from frame_cache.cache_utils import ensure_cached_frame_paths
 
     try:
         from ..video_utils import get_manual_rotation, apply_rotation
@@ -91,7 +91,7 @@ def extract_frames_to_dir(video_path: str, frame_ids: list[int], tmp_dir: str) -
         _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from video_utils import get_manual_rotation, apply_rotation
 
-    cached = get_cached_frame_paths(Path(video_path).parent, frame_ids)
+    cached = ensure_cached_frame_paths(Path(video_path).parent, frame_ids)
     if cached:
         return cached
 

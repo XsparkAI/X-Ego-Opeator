@@ -30,6 +30,7 @@
 import argparse
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -56,10 +57,23 @@ CODECS = {
     "copy":    "copy",        # stream copy, 不重编码
 }
 
+CODEC_FAMILIES = {
+    "h264": {"h264"},
+    "h265": {"hevc", "h265"},
+    "hevc": {"hevc", "h265"},
+    "ffv1": {"ffv1"},
+    "prores": {"prores"},
+    "vp9": {"vp9"},
+    "av1": {"av1"},
+    "copy": set(),
+}
+
 # 各编码器的无损参数
 LOSSLESS_PARAMS = {
     "libx264":    ["-crf", "0", "-preset", "veryslow"],
     "libx265":    ["-x265-params", "lossless=1", "-preset", "veryslow"],
+    "h264_nvenc": ["-preset", "p4", "-rc", "constqp", "-qp", "0"],
+    "hevc_nvenc": ["-preset", "p4", "-rc", "constqp", "-qp", "0"],
     "ffv1":       ["-level", "3", "-slicecrc", "1"],  # FFV1 天然无损
     "prores_ks":  ["-profile:v", "4", "-qscale:v", "0"],  # ProRes 4444 XQ
     "libvpx-vp9": ["-lossless", "1"],
@@ -70,6 +84,8 @@ LOSSLESS_PARAMS = {
 QUALITY_PARAMS = {
     "libx264":    ["-preset", "veryslow", "-profile:v", "high"],
     "libx265":    ["-preset", "veryslow", "-profile:v", "main"],
+    "h264_nvenc": ["-preset", "p4", "-rc", "vbr", "-cq", "18", "-profile:v", "high"],
+    "hevc_nvenc": ["-preset", "p4", "-rc", "vbr", "-cq", "18", "-profile:v", "main"],
     "libvpx-vp9": ["-quality", "best", "-speed", "0"],
     "libsvtav1":  ["-preset", "2"],
     "prores_ks":  ["-profile:v", "4"],
@@ -88,15 +104,64 @@ CONTAINERS = {
 
 # 容器与编码兼容性
 CONTAINER_CODEC_COMPAT = {
-    "mp4":  {"libx264", "libx265", "libsvtav1", "copy"},
-    "mkv":  {"libx264", "libx265", "ffv1", "libvpx-vp9", "libsvtav1", "copy"},
-    "mov":  {"libx264", "libx265", "prores_ks", "copy"},
-    "avi":  {"libx264", "ffv1", "copy"},
+    "mp4":  {"libx264", "h264_nvenc", "libx265", "hevc_nvenc", "libsvtav1", "copy"},
+    "mkv":  {"libx264", "h264_nvenc", "libx265", "hevc_nvenc", "ffv1", "libvpx-vp9", "libsvtav1", "copy"},
+    "mov":  {"libx264", "h264_nvenc", "libx265", "hevc_nvenc", "prores_ks", "copy"},
+    "avi":  {"libx264", "h264_nvenc", "ffv1", "copy"},
     "webm": {"libvpx-vp9", "libsvtav1", "copy"},
-    "mxf":  {"libx264", "libx265", "prores_ks", "copy"},
+    "mxf":  {"libx264", "h264_nvenc", "libx265", "hevc_nvenc", "prores_ks", "copy"},
 }
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".mxf", ".ts", ".flv", ".wmv"}
+
+
+def _ffmpeg_hw_caps() -> dict:
+    encoders = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-encoders"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    cuda_probe = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "nullsrc=s=16x16:d=0.1",
+            "-vf",
+            "hwupload_cuda,scale_cuda=16:16",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    return {
+        "cuda_runtime": cuda_probe.returncode == 0,
+        "h264_nvenc": "h264_nvenc" in encoders,
+        "hevc_nvenc": "hevc_nvenc" in encoders,
+    }
+
+
+def _select_encoder(codec_name: str | None, *, prefer_gpu: bool = True) -> str | None:
+    if not codec_name:
+        return None
+    normalized = codec_name.lower()
+    caps = _ffmpeg_hw_caps() if prefer_gpu else {}
+    if normalized == "h264":
+        if caps.get("cuda_runtime") and caps.get("h264_nvenc"):
+            return "h264_nvenc"
+        return "libx264"
+    if normalized in {"h265", "hevc"}:
+        if caps.get("cuda_runtime") and caps.get("hevc_nvenc"):
+            return "hevc_nvenc"
+        return "libx265"
+    return CODECS.get(normalized)
 
 
 # ──────────────────────────── 探测 ────────────────────────────
@@ -221,8 +286,9 @@ def plan_transcode(
     target_container = spec.container or out_ext or info.container
 
     # 确定目标编码器
+    desired_codec = spec.codec.lower() if spec.codec else None
     if spec.codec:
-        encoder = CODECS.get(spec.codec)
+        encoder = _select_encoder(spec.codec)
         if not encoder:
             raise ValueError(f"Unknown codec: {spec.codec}. Supported: {list(CODECS.keys())}")
     else:
@@ -242,11 +308,7 @@ def plan_transcode(
 
     needs_codec_change = False
     if encoder and encoder != "copy":
-        # 检查源编码是否已匹配
-        source_codec_map = {"h264": "libx264", "hevc": "libx265", "vp9": "libvpx-vp9",
-                            "av1": "libsvtav1", "ffv1": "ffv1", "prores": "prores_ks"}
-        source_encoder = source_codec_map.get(info.codec, "")
-        if source_encoder != encoder:
+        if info.codec not in CODEC_FAMILIES.get(desired_codec or "", {info.codec}):
             needs_codec_change = True
 
     needs_pix_fmt = spec.pix_fmt and spec.pix_fmt != info.pix_fmt
@@ -269,7 +331,10 @@ def plan_transcode(
         )
 
     if not encoder:
-        encoder = "copy"
+        if needs_reencode:
+            encoder = _select_encoder(info.codec) or "libx264"
+        else:
+            encoder = "copy"
 
     # 检查容器兼容性
     if target_container in CONTAINER_CODEC_COMPAT:

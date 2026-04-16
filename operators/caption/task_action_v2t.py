@@ -159,12 +159,24 @@ def build_windows_for_range(
 
 def save_frames_as_tmp_jpg(video_path: str | Path, frame_ids: list[int], tmp_dir: str) -> list[str]:
     try:
+        from ..frame_cache.cache_utils import ensure_cached_frame_paths
+    except ImportError:
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from frame_cache.cache_utils import ensure_cached_frame_paths
+
+    try:
         from ..video_utils import apply_rotation, get_manual_rotation
     except ImportError:
         import sys
 
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from video_utils import apply_rotation, get_manual_rotation
+
+    cached = ensure_cached_frame_paths(Path(video_path).parent, frame_ids)
+    if cached:
+        return cached
 
     video_path = str(video_path)
     rotation = get_manual_rotation(video_path)
@@ -186,12 +198,24 @@ def save_frames_as_tmp_jpg(video_path: str | Path, frame_ids: list[int], tmp_dir
 
 def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
     try:
+        from ..frame_cache.cache_utils import ensure_cached_frame_b64
+    except ImportError:
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from frame_cache.cache_utils import ensure_cached_frame_b64
+
+    try:
         from ..video_utils import apply_rotation, get_manual_rotation
     except ImportError:
         import sys
 
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from video_utils import apply_rotation, get_manual_rotation
+
+    cached = ensure_cached_frame_b64(Path(video_path).parent, frame_ids)
+    if cached:
+        return cached
 
     rotation = get_manual_rotation(video_path)
     cap = cv2.VideoCapture(video_path)

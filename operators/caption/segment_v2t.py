@@ -134,7 +134,12 @@ def build_windows(fps: float, nframes: int) -> list[Window]:
 
 def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
     """Extract specific frames from video as base64-encoded JPG strings."""
+    from ..frame_cache.cache_utils import ensure_cached_frame_b64
     from ..video_utils import get_manual_rotation, apply_rotation
+
+    cached = ensure_cached_frame_b64(Path(video_path).parent, frame_ids)
+    if cached:
+        return cached
 
     rotation = get_manual_rotation(video_path)
     cap = cv2.VideoCapture(video_path)
@@ -154,10 +159,10 @@ def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
 
 def save_frames_as_tmp_jpg(video_path: str, frame_ids: list[int], tmp_dir: str) -> list[str]:
     """Extract frames and save as temporary JPG files. Returns file paths."""
-    from ..frame_cache.cache_utils import get_cached_frame_paths
+    from ..frame_cache.cache_utils import ensure_cached_frame_paths
     from ..video_utils import get_manual_rotation, apply_rotation
 
-    cached = get_cached_frame_paths(Path(video_path).parent, frame_ids)
+    cached = ensure_cached_frame_paths(Path(video_path).parent, frame_ids)
     if cached:
         return cached
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import base64
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,6 +120,43 @@ def get_cached_frame_paths(
             return None
         paths.append(str(path))
     return paths
+
+
+def ensure_cached_frame_paths(
+    episode_dir: Path,
+    frame_ids: list[int],
+    profile: str = PROFILE_VLM,
+) -> list[str] | None:
+    cached = get_cached_frame_paths(episode_dir, frame_ids, profile=profile)
+    if cached is not None:
+        return cached
+    build_cache(episode_dir, frame_ids, profile=profile)
+    return get_cached_frame_paths(episode_dir, frame_ids, profile=profile)
+
+
+def load_cached_frame_b64(
+    episode_dir: Path,
+    frame_ids: list[int],
+    profile: str = PROFILE_VLM,
+) -> list[str] | None:
+    paths = get_cached_frame_paths(episode_dir, frame_ids, profile=profile)
+    if paths is None:
+        return None
+    return [base64.b64encode(Path(path).read_bytes()).decode("ascii") for path in paths]
+
+
+def ensure_cached_frame_b64(
+    episode_dir: Path,
+    frame_ids: list[int],
+    profile: str = PROFILE_VLM,
+) -> list[str] | None:
+    frames_b64 = load_cached_frame_b64(episode_dir, frame_ids, profile=profile)
+    if frames_b64 is not None:
+        return frames_b64
+    paths = ensure_cached_frame_paths(episode_dir, frame_ids, profile=profile)
+    if paths is None:
+        return None
+    return [base64.b64encode(Path(path).read_bytes()).decode("ascii") for path in paths]
 
 
 def build_sample_fps_frame_ids(
@@ -310,6 +348,18 @@ def load_cached_quality_frames(
         "decoder": "frame_cache",
     }
     return frames_gray, cached_ids, meta
+
+
+def load_or_build_cached_quality_frames(
+    episode_dir: Path,
+    frame_ids: list[int],
+    profile: str = PROFILE_QUALITY,
+) -> tuple[list[np.ndarray], list[int], dict] | None:
+    cached = load_cached_quality_frames(episode_dir, frame_ids, profile=profile)
+    if cached is not None:
+        return cached
+    build_quality_cache(episode_dir, frame_ids, profile=profile)
+    return load_cached_quality_frames(episode_dir, frame_ids, profile=profile)
 
 
 def cleanup_cache(episode_dir: Path) -> None:

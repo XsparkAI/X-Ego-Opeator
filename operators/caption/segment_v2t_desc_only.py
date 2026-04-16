@@ -161,6 +161,12 @@ def build_windows(fps: float, nframes: int) -> list[Window]:
 
 def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
     """Extract specific frames from video as base64-encoded JPG strings."""
+    from ..frame_cache.cache_utils import ensure_cached_frame_b64
+
+    cached = ensure_cached_frame_b64(Path(video_path).parent, frame_ids)
+    if cached:
+        return cached
+
     cap = cv2.VideoCapture(video_path)
     results = []
     for fid in sorted(set(frame_ids)):
@@ -177,6 +183,12 @@ def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
 
 def save_frames_as_tmp_jpg(video_path: str, frame_ids: list[int], tmp_dir: str) -> list[str]:
     """Extract frames and save as temporary JPG files. Returns file paths."""
+    from ..frame_cache.cache_utils import ensure_cached_frame_paths
+
+    cached = ensure_cached_frame_paths(Path(video_path).parent, frame_ids)
+    if cached:
+        return cached
+
     cap = cv2.VideoCapture(video_path)
     paths = []
     for i, fid in enumerate(sorted(set(frame_ids))):

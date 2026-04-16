@@ -23,7 +23,7 @@ import numpy as np
 
 from ..frame_cache.cache_utils import (
     build_sample_fps_frame_ids,
-    load_cached_quality_frames,
+    load_or_build_cached_quality_frames,
     probe_video,
 )
 from . import op_quality, op_stability, op_exposure
@@ -175,7 +175,7 @@ def read_frames(video_path: str, sample_fps: Optional[float] = None):
     try:
         fps, total_frames = probe_video(Path(video_path))
         frame_ids = build_sample_fps_frame_ids(fps, total_frames, sample_fps)
-        cached = load_cached_quality_frames(episode_dir, frame_ids)
+        cached = load_or_build_cached_quality_frames(episode_dir, frame_ids)
         if cached is not None:
             frames_gray, frame_indices, meta = cached
             step = (

@@ -10,14 +10,14 @@
 
 # ── 数据集源（Episode）配置 ───────────────────────────────────────────
 # 选项 1：明确指定 episode 目录（支持单个路径或列表；目录内需包含 input_video_path 指定的视频）
-episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/bytedance/家务/切菜"
+episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/test_episode_30s"
 
 # 选项 2：自动扫描根目录下的所有数据集目录
 # （包含 input_video_path 指定视频文件的子目录将被视为一个独立的数据集）
 # episode_root: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic"
 
 # 每个 episode 内输入视频的相对路径。
-input_video_path: cam_head.mp4
+input_video_path: rgb.mp4
 
 # ── VLM API 配置 ─────────────────────────────────────────────────── 
 # 用于所有需要调用 DashScope VLM 的算子。
@@ -70,7 +70,7 @@ execution_mode: pipeline
 # 若完全省略某个算子配置块，则使用默认值（即 enabled: true）。
 #
 # 当前依赖关系摘要：
-#   frame_cache -> video_segmentation / hand_analysis / video_qua lity
+#   frame_cache -> video_segmentation / hand_analysis / video_quality
 #   video_segmentation -> segment_cut
 #   privacy_blur 不依赖 segment_cut，可直接在当前 work_dir 上运行
 #   transcode 优先消费 rgb_blurred.mp4，因此默认依赖 privacy_blur
@@ -87,7 +87,7 @@ operators:
     enabled: true            # 预抽取 video_segmentation / hand_analysis / video_quality 可复用的稀疏帧
 
   video_segmentation:
-    enabled: true            # VLM 分段标注
+    enabled: false            # VLM 分段标注
     method: task_action_v2t      # "segment_v2t" | "task_action_v2t"
     batch_enabled: false      # true=默认 batch 提交；false=直接请求，不走 batch
     batch_poll_interval_sec: 20
@@ -103,7 +103,7 @@ operators:
     action_frames_per_window: 8
 
   segment_cut:
-    enabled: true           # 按 caption_v2t.json 裁剪短视频；若 video_segmentation 关闭会自动跳过
+    enabled: false           # 按 caption_v2t.json 裁剪短视频；若 video_segmentation 关闭会自动跳过
     min_duration_sec: 0.5    # 跳过短于此秒数的片段
     granularity: task  # "atomic_action" | "task"
 
@@ -133,9 +133,18 @@ operators:
     input_height: 720        # 检测前的图像缩放高度
 
   privacy_blur:
-    enabled: true
+    enabled: yolo
+    # detector_backend:
+    #   "egoblur" — 专用人脸/车牌检测模型，适合隐私打码（默认）
+    #   "yolo"    — 通用 YOLO 检测，可加载 weights/yolo26n.pt 等权重并按类别打码
+    detector_backend: egoblur
     face_thresh: 0.4      # 覆盖默认的人脸检测阈值
     lp_thresh: 0.3        # 覆盖默认的车牌检测阈值
+    # ── YOLO 专用参数（仅 detector_backend=yolo 时生效）──
+    yolo_model_path: weights/yolo26n.pt
+    yolo_conf_thresh: 0.25
+    # yolo_classes: [0]   # 例如 COCO 的 0=person；留空表示不过滤类别
+    yolo_input_size: 960
 
   transcode:
     enabled: false           # 默认关闭

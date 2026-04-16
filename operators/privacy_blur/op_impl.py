@@ -76,11 +76,16 @@ def _concat_blurred_to_root(episode_root: Path) -> None:
 
 @dataclass
 class PrivacyBlurConfig:
+    detector_backend: str = "egoblur"
     face: bool = True
     lp: bool = True
     scale: float = 1.0
     face_thresh: float | None = None
     lp_thresh: float | None = None
+    yolo_model_path: str = "weights/yolo26n.pt"
+    yolo_conf_thresh: float = 0.25
+    yolo_classes: list[int] | None = None
+    yolo_input_size: int | None = 960
     max_concurrency: int = 1
 
 
@@ -97,14 +102,28 @@ class PrivacyBlurOperator:
     def _ensure_detectors(self):
         """Load face/LP detectors once, reuse across episodes."""
         if self._detectors is None:
-            from .blur_privacy import _build_detectors, _get_device
-            device = _get_device()
-            self._detectors = _build_detectors(
-                device,
-                face=self.config.face, lp=self.config.lp,
-                face_thresh=self.config.face_thresh,
-                lp_thresh=self.config.lp_thresh,
+            from .blur_privacy import (
+                _build_detectors,
+                _build_yolo_detector,
+                _get_device,
             )
+
+            backend = self.config.detector_backend.lower()
+            if backend == "egoblur":
+                device = _get_device()
+                self._detectors = _build_detectors(
+                    device,
+                    face=self.config.face,
+                    lp=self.config.lp,
+                    face_thresh=self.config.face_thresh,
+                    lp_thresh=self.config.lp_thresh,
+                )
+            elif backend == "yolo":
+                self._detectors = _build_yolo_detector(self.config.yolo_model_path)
+            else:
+                raise ValueError(
+                    f"privacy_blur.detector_backend must be 'egoblur' or 'yolo', got {self.config.detector_backend!r}"
+                )
             log.info("Privacy blur detectors loaded (will reuse across episodes)")
 
     def run(self, episode_dir: Path, **kwargs) -> OperatorResult:
@@ -125,10 +144,15 @@ class PrivacyBlurOperator:
             try:
                 summary = blur_video(
                     video_path, output_path,
+                    detector_backend=self.config.detector_backend,
                     face=self.config.face, lp=self.config.lp,
                     scale=self.config.scale,
                     face_thresh=self.config.face_thresh,
                     lp_thresh=self.config.lp_thresh,
+                    yolo_model_path=self.config.yolo_model_path,
+                    yolo_conf_thresh=self.config.yolo_conf_thresh,
+                    yolo_classes=self.config.yolo_classes,
+                    yolo_input_size=self.config.yolo_input_size,
                     detectors=self._detectors,
                 )
 
