@@ -77,6 +77,7 @@ def _concat_blurred_to_root(episode_root: Path) -> None:
 @dataclass
 class PrivacyBlurConfig:
     detector_backend: str = "egoblur"
+    blur_targets: str = "both"  # "face" | "lp" | "both"
     face: bool = True
     lp: bool = True
     scale: float = 1.0
@@ -84,7 +85,6 @@ class PrivacyBlurConfig:
     lp_thresh: float | None = None
     yolo_model_path: str = "weights/yolo26n.pt"
     yolo_conf_thresh: float = 0.25
-    yolo_classes: list[int] | None = None
     yolo_input_size: int | None = 960
     max_concurrency: int = 1
 
@@ -106,15 +106,21 @@ class PrivacyBlurOperator:
                 _build_detectors,
                 _build_yolo_detector,
                 _get_device,
+                _resolve_blur_flags,
             )
 
+            face_enabled, lp_enabled = _resolve_blur_flags(
+                self.config.blur_targets,
+                face=self.config.face,
+                lp=self.config.lp,
+            )
             backend = self.config.detector_backend.lower()
             if backend == "egoblur":
                 device = _get_device()
                 self._detectors = _build_detectors(
                     device,
-                    face=self.config.face,
-                    lp=self.config.lp,
+                    face=face_enabled,
+                    lp=lp_enabled,
                     face_thresh=self.config.face_thresh,
                     lp_thresh=self.config.lp_thresh,
                 )
@@ -145,13 +151,13 @@ class PrivacyBlurOperator:
                 summary = blur_video(
                     video_path, output_path,
                     detector_backend=self.config.detector_backend,
+                    blur_targets=self.config.blur_targets,
                     face=self.config.face, lp=self.config.lp,
                     scale=self.config.scale,
                     face_thresh=self.config.face_thresh,
                     lp_thresh=self.config.lp_thresh,
                     yolo_model_path=self.config.yolo_model_path,
                     yolo_conf_thresh=self.config.yolo_conf_thresh,
-                    yolo_classes=self.config.yolo_classes,
                     yolo_input_size=self.config.yolo_input_size,
                     detectors=self._detectors,
                 )

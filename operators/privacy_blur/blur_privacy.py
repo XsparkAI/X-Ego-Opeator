@@ -50,6 +50,80 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 FACE_MODEL = PROJECT_ROOT / "weights" / "ego_blur_face_gen2.jit"
 LP_MODEL = PROJECT_ROOT / "weights" / "ego_blur_lp_gen2.jit"
+YOLO_FACE_LABEL_HINTS = {
+    "face",
+    "faces",
+    "human face",
+    "person face",
+}
+YOLO_LP_LABEL_HINTS = {
+    "license plate",
+    "licence plate",
+    "plate",
+    "plates",
+    "number plate",
+    "car plate",
+    "vehicle plate",
+    "lp",
+}
+
+
+def _resolve_blur_flags(
+    blur_targets: str | None,
+    *,
+    face: bool = True,
+    lp: bool = True,
+) -> tuple[bool, bool]:
+    """Resolve a unified blur target selector with backward-compatible booleans."""
+    if blur_targets is None:
+        return face, lp
+
+    normalized = str(blur_targets).strip().lower()
+    if normalized == "both":
+        return True, True
+    if normalized == "face":
+        return True, False
+    if normalized in {"lp", "plate", "license_plate", "license-plate"}:
+        return False, True
+    raise ValueError(
+        f"privacy_blur.blur_targets must be 'face', 'lp', or 'both', got {blur_targets!r}"
+    )
+
+
+def _resolve_yolo_classes(
+    blur_targets: str | None,
+    *,
+    face: bool,
+    lp: bool,
+    model: Any,
+) -> list[int] | None:
+    """Infer YOLO class ids from model class names."""
+    face_enabled, lp_enabled = _resolve_blur_flags(blur_targets, face=face, lp=lp)
+    names = getattr(model, "names", {}) or {}
+    items = names.items() if isinstance(names, dict) else enumerate(names)
+    class_ids: list[int] = []
+
+    for cls_id, raw_name in items:
+        name = str(raw_name).strip().lower().replace("_", " ").replace("-", " ")
+        if face_enabled and name in YOLO_FACE_LABEL_HINTS:
+            class_ids.append(int(cls_id))
+        if lp_enabled and name in YOLO_LP_LABEL_HINTS:
+            class_ids.append(int(cls_id))
+
+    resolved = sorted(set(class_ids))
+    if not resolved:
+        requested = []
+        if face_enabled:
+            requested.append("face")
+        if lp_enabled:
+            requested.append("lp")
+        log.warning(
+            "YOLO blur target resolution found no matching classes for %s in model names=%s",
+            "+".join(requested) or "none",
+            list(names.values()) if isinstance(names, dict) else list(names),
+        )
+        return None
+    return resolved
 
 
 # ── detector management ─────────────────────────────────────────────
@@ -350,6 +424,7 @@ def blur_video(
     video_path: Path,
     output_path: Path,
     detector_backend: str = "egoblur",
+    blur_targets: str = "both",
     face: bool = True,
     lp: bool = True,
     scale: float = 1.0,
@@ -357,7 +432,6 @@ def blur_video(
     lp_thresh: float | None = None,
     yolo_model_path: str | Path = "weights/yolo26n.pt",
     yolo_conf_thresh: float = 0.25,
-    yolo_classes: list[int] | None = None,
     yolo_input_size: int | None = 960,
     resize: int | None = None,
     detectors: Any = None,
@@ -377,6 +451,11 @@ def blur_video(
     Returns a summary dict with detection stats.
     """
     backend = str(detector_backend).lower()
+    face_enabled, lp_enabled = _resolve_blur_flags(
+        blur_targets,
+        face=face,
+        lp=lp,
+    )
     device = _get_device()
     face_det = lp_det = yolo_model = None
 
@@ -385,13 +464,23 @@ def blur_video(
             face_det, lp_det = detectors
         else:
             face_det, lp_det = _build_detectors(
-                device, face=face, lp=lp, face_thresh=face_thresh, lp_thresh=lp_thresh,
+                device,
+                face=face_enabled,
+                lp=lp_enabled,
+                face_thresh=face_thresh,
+                lp_thresh=lp_thresh,
             )
     elif backend == "yolo":
         if detectors is not None:
             yolo_model = detectors
         else:
             yolo_model = _build_yolo_detector(yolo_model_path)
+        resolved_yolo_classes = _resolve_yolo_classes(
+            blur_targets,
+            face=face,
+            lp=lp,
+            model=yolo_model,
+        )
     else:
         raise ValueError(
             f"Unsupported detector_backend={detector_backend!r}, expected 'egoblur' or 'yolo'"
@@ -461,7 +550,7 @@ def blur_video(
                     det_frame,
                     yolo_model,
                     conf_thresh=yolo_conf_thresh,
-                    class_ids=yolo_classes,
+                    class_ids=resolved_yolo_classes,
                     input_size=yolo_input_size,
                 )
 
@@ -509,14 +598,15 @@ def blur_video(
         "detections_total": total_detections,
         "frames_with_detections": frames_with_detections,
         "detector_backend": backend,
-        "blur_face": face,
-        "blur_lp": lp,
+        "blur_targets": blur_targets,
+        "blur_face": face_enabled,
+        "blur_lp": lp_enabled,
         "scale_factor": scale,
     }
     if backend == "yolo":
         summary["yolo_model_path"] = str(yolo_model_path)
         summary["yolo_conf_thresh"] = yolo_conf_thresh
-        summary["yolo_classes"] = yolo_classes
+        summary["resolved_yolo_classes"] = resolved_yolo_classes
         summary["yolo_input_size"] = yolo_input_size
 
     log.info(
@@ -578,17 +668,11 @@ def main():
     parser.add_argument("--output", type=Path, default=None, help="Output video path (--video mode)")
     parser.add_argument("--scale", type=float, default=1.0, help="Blur region scale factor (default: 1.0)")
     parser.add_argument("--detector-backend", type=str, default="egoblur", help="Detector backend: egoblur | yolo")
+    parser.add_argument("--blur-targets", type=str, default="both", help="Blur targets: face | lp | both")
     parser.add_argument("--face-thresh", type=float, default=None, help="Face detection threshold")
     parser.add_argument("--lp-thresh", type=float, default=None, help="LP detection threshold")
     parser.add_argument("--yolo-model-path", type=str, default="weights/yolo26n.pt", help="YOLO weights path")
     parser.add_argument("--yolo-conf-thresh", type=float, default=0.25, help="YOLO detection threshold")
-    parser.add_argument(
-        "--yolo-classes",
-        type=int,
-        nargs="*",
-        default=None,
-        help="Optional YOLO class ids to blur, e.g. --yolo-classes 0 2 7",
-    )
     parser.add_argument("--yolo-input-size", type=int, default=960, help="YOLO imgsz")
     parser.add_argument("--preview", action="store_true", help="Generate side-by-side preview")
     args = parser.parse_args()
@@ -607,11 +691,11 @@ def main():
         video_path,
         output_path,
         detector_backend=args.detector_backend,
+        blur_targets=args.blur_targets,
         scale=args.scale,
         face_thresh=args.face_thresh, lp_thresh=args.lp_thresh,
         yolo_model_path=args.yolo_model_path,
         yolo_conf_thresh=args.yolo_conf_thresh,
-        yolo_classes=args.yolo_classes,
         yolo_input_size=args.yolo_input_size,
     )
 
