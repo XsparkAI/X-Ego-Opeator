@@ -10,7 +10,7 @@
 
 # ── 数据集源（Episode）配置 ───────────────────────────────────────────
 # 选项 1：明确指定 episode 目录（支持单个路径或列表；目录内需包含 input_video_path 指定的视频）
-episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic/episode0"
+episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/test_episode_30s"
 
 # 选项 2：自动扫描根目录下的所有数据集目录
 # （包含 input_video_path 指定视频文件的子目录将被视为一个独立的数据集）
@@ -72,7 +72,7 @@ execution_mode: pipeline
 # 当前依赖关系摘要：
 #   frame_cache -> video_segmentation / ha # 说明：
     #   egoblur 后端会直接启用/关闭对应检测器；
-    #   yolo 后端会根据模型类别名自动匹配目标，若模型里没有 face / plate 类别，则不会命中nd_analysis / video_quality
+    #   yolo 后端会根据模型类别名自动匹配目标，若模型里没有 face / plate 类别，则不会命中nd_analysis / vidfakseo_quality
 #   video_segmentation -> segment_cut
 #   privacy_blur 不依赖 segment_cut，可直接在当前 work_dir 上运行
 #   transcode 优先消费 rgb_blurred.mp4，因此默认依赖 privacy_blur
@@ -138,7 +138,7 @@ operators:
     enabled: true
     # detector_backend:
     #   "egoblur" — 专用人脸/车牌检测模型，适合隐私打码（默认）
-    #   "yolo"    — YOLO 检测；会按模型自带的类别名自动匹配 face / license plate
+    #   "yolo"          — 分别调用专用的人脸 / 车牌 YOLO 模型进行打码
     detector_backend: egoblur
     # blur_targets:
     #   "both" — 同时打码人脸和车牌（默认）
@@ -146,12 +146,14 @@ operators:
     #   "lp"   — 只打码车牌
     # 说明：
     #   egoblur 后端会直接启用/关闭对应检测器；
-    #   yolo 后端会根据模型类别名自动匹配目标，若模型里没有 face / plate 类别，则不会命中
+    #   yolo 后端要求为启用的目标分别提供专用模型路径
+    #   yolo_official 后端主要按 classes 过滤目标，blur_targets 仅保留为兼容项
     blur_targets: face
     face_thresh: 0.4      # 覆盖默认的人脸检测阈值
     lp_thresh: 0.3        # 覆盖默认的车牌检测阈值
     # ── YOLO 专用参数（仅 detector_backend=yolo 时生效）──
-    yolo_model_path: weights/yolo26n.pt
+    yolo_face_model_path: weights/yolo_face.pt
+    yolo_lp_model_path: weights/yolo_lp.pt
     yolo_conf_thresh: 0.25
     yolo_input_size: 960
 

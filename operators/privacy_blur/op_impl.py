@@ -83,9 +83,13 @@ class PrivacyBlurConfig:
     scale: float = 1.0
     face_thresh: float | None = None
     lp_thresh: float | None = None
-    yolo_model_path: str = "weights/yolo26n.pt"
+    yolo_face_model_path: str | None = None
+    yolo_lp_model_path: str | None = None
     yolo_conf_thresh: float = 0.25
     yolo_input_size: int | None = 960
+    yolo_official_model_path: str = "weights/yolo26n.pt"
+    yolo_official_classes: list[int] | None = None
+    yolo_official_blur_ratio: float = 0.5
     max_concurrency: int = 1
 
 
@@ -104,7 +108,8 @@ class PrivacyBlurOperator:
         if self._detectors is None:
             from .blur_privacy import (
                 _build_detectors,
-                _build_yolo_detector,
+                _build_yolo_detectors,
+                _build_yolo_official_blurrer,
                 _get_device,
                 _resolve_blur_flags,
             )
@@ -125,10 +130,23 @@ class PrivacyBlurOperator:
                     lp_thresh=self.config.lp_thresh,
                 )
             elif backend == "yolo":
-                self._detectors = _build_yolo_detector(self.config.yolo_model_path)
+                self._detectors = _build_yolo_detectors(
+                    face_enabled=face_enabled,
+                    lp_enabled=lp_enabled,
+                    face_model_path=self.config.yolo_face_model_path,
+                    lp_model_path=self.config.yolo_lp_model_path,
+                )
+            elif backend == "yolo_official":
+                self._detectors = _build_yolo_official_blurrer(
+                    model_path=self.config.yolo_official_model_path,
+                    classes=self.config.yolo_official_classes,
+                    blur_ratio=self.config.yolo_official_blur_ratio,
+                    conf_thresh=self.config.yolo_conf_thresh,
+                )
             else:
                 raise ValueError(
-                    f"privacy_blur.detector_backend must be 'egoblur' or 'yolo', got {self.config.detector_backend!r}"
+                    "privacy_blur.detector_backend must be 'egoblur', 'yolo', or 'yolo_official', "
+                    f"got {self.config.detector_backend!r}"
                 )
             log.info("Privacy blur detectors loaded (will reuse across episodes)")
 
@@ -156,9 +174,13 @@ class PrivacyBlurOperator:
                     scale=self.config.scale,
                     face_thresh=self.config.face_thresh,
                     lp_thresh=self.config.lp_thresh,
-                    yolo_model_path=self.config.yolo_model_path,
+                    yolo_face_model_path=self.config.yolo_face_model_path,
+                    yolo_lp_model_path=self.config.yolo_lp_model_path,
                     yolo_conf_thresh=self.config.yolo_conf_thresh,
                     yolo_input_size=self.config.yolo_input_size,
+                    yolo_official_model_path=self.config.yolo_official_model_path,
+                    yolo_official_classes=self.config.yolo_official_classes,
+                    yolo_official_blur_ratio=self.config.yolo_official_blur_ratio,
                     detectors=self._detectors,
                 )
 

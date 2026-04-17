@@ -50,22 +50,6 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 FACE_MODEL = PROJECT_ROOT / "weights" / "ego_blur_face_gen2.jit"
 LP_MODEL = PROJECT_ROOT / "weights" / "ego_blur_lp_gen2.jit"
-YOLO_FACE_LABEL_HINTS = {
-    "face",
-    "faces",
-    "human face",
-    "person face",
-}
-YOLO_LP_LABEL_HINTS = {
-    "license plate",
-    "licence plate",
-    "plate",
-    "plates",
-    "number plate",
-    "car plate",
-    "vehicle plate",
-    "lp",
-}
 
 
 def _resolve_blur_flags(
@@ -88,42 +72,6 @@ def _resolve_blur_flags(
     raise ValueError(
         f"privacy_blur.blur_targets must be 'face', 'lp', or 'both', got {blur_targets!r}"
     )
-
-
-def _resolve_yolo_classes(
-    blur_targets: str | None,
-    *,
-    face: bool,
-    lp: bool,
-    model: Any,
-) -> list[int] | None:
-    """Infer YOLO class ids from model class names."""
-    face_enabled, lp_enabled = _resolve_blur_flags(blur_targets, face=face, lp=lp)
-    names = getattr(model, "names", {}) or {}
-    items = names.items() if isinstance(names, dict) else enumerate(names)
-    class_ids: list[int] = []
-
-    for cls_id, raw_name in items:
-        name = str(raw_name).strip().lower().replace("_", " ").replace("-", " ")
-        if face_enabled and name in YOLO_FACE_LABEL_HINTS:
-            class_ids.append(int(cls_id))
-        if lp_enabled and name in YOLO_LP_LABEL_HINTS:
-            class_ids.append(int(cls_id))
-
-    resolved = sorted(set(class_ids))
-    if not resolved:
-        requested = []
-        if face_enabled:
-            requested.append("face")
-        if lp_enabled:
-            requested.append("lp")
-        log.warning(
-            "YOLO blur target resolution found no matching classes for %s in model names=%s",
-            "+".join(requested) or "none",
-            list(names.values()) if isinstance(names, dict) else list(names),
-        )
-        return None
-    return resolved
 
 
 # ── detector management ─────────────────────────────────────────────
@@ -199,6 +147,75 @@ def _build_yolo_detector(model_path: str | Path):
     model = YOLO(str(weights))
     log.info(f"YOLO blur detector loaded from {weights}")
     return model
+
+
+def _build_yolo_detectors(
+    *,
+    face_enabled: bool,
+    lp_enabled: bool,
+    face_model_path: str | Path | None = None,
+    lp_model_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """Initialise dedicated face / lp YOLO models."""
+    detectors: dict[str, Any] = {"face_model": None, "lp_model": None}
+    if face_enabled and face_model_path:
+        detectors["face_model"] = _build_yolo_detector(face_model_path)
+    if lp_enabled and lp_model_path:
+        detectors["lp_model"] = _build_yolo_detector(lp_model_path)
+    missing = []
+    if face_enabled and detectors["face_model"] is None:
+        missing.append("yolo_face_model_path")
+    if lp_enabled and detectors["lp_model"] is None:
+        missing.append("yolo_lp_model_path")
+    if missing:
+        raise ValueError(
+            "YOLO privacy blur requires dedicated model paths for enabled targets: "
+            + ", ".join(missing)
+        )
+    return detectors
+
+
+def _build_yolo_official_blurrer(
+    *,
+    model_path: str | Path,
+    classes: list[int] | None = None,
+    blur_ratio: float = 0.5,
+    conf_thresh: float = 0.25,
+):
+    """Initialise Ultralytics official ObjectBlurrer."""
+    from ultralytics import solutions
+    import ultralytics.solutions.solutions as ul_solutions_mod
+
+    weights = Path(model_path)
+    if not weights.is_absolute():
+        repo_candidate = PROJECT_ROOT.parent.parent / weights
+        if repo_candidate.exists():
+            weights = repo_candidate
+    if not weights.exists():
+        raise FileNotFoundError(f"YOLO official weights not found: {weights}")
+
+    # BaseSolution runs check_imshow() during init, which can hard-crash in headless environments.
+    ul_solutions_mod.check_imshow = lambda warn=False: False
+
+    blurrer = solutions.ObjectBlurrer(
+        model=str(weights),
+        classes=classes,
+        blur_ratio=blur_ratio,
+        conf=conf_thresh,
+        show=False,
+        show_in=False,
+        show_out=False,
+        verbose=False,
+        show_labels=False,
+        show_conf=False,
+    )
+    log.info(
+        "YOLO official ObjectBlurrer loaded from %s (classes=%s, blur_ratio=%.2f)",
+        weights,
+        classes,
+        blur_ratio,
+    )
+    return blurrer
 
 
 # ── blur helpers ─────────────────────────────────────────────────────
@@ -288,6 +305,32 @@ def _detect_frame_yolo(
 
     xyxy = boxes_result.xyxy.cpu().numpy()
     return [[float(v) for v in row.tolist()] for row in xyxy]
+
+
+def _dedupe_boxes(boxes: list[list[float]], iou_thresh: float = 0.9) -> list[list[float]]:
+    """Drop near-identical boxes when merging outputs from multiple detectors."""
+    if not boxes:
+        return []
+
+    def _iou(a: list[float], b: list[float]) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        denom = area_a + area_b - inter
+        return inter / denom if denom > 0 else 0.0
+
+    kept: list[list[float]] = []
+    for box in boxes:
+        if all(_iou(box, existing) < iou_thresh for existing in kept):
+            kept.append(box)
+    return kept
 
 
 # ── video probe ─────────────────────────────────────────────────────
@@ -430,9 +473,13 @@ def blur_video(
     scale: float = 1.0,
     face_thresh: float | None = None,
     lp_thresh: float | None = None,
-    yolo_model_path: str | Path = "weights/yolo26n.pt",
+    yolo_face_model_path: str | Path | None = None,
+    yolo_lp_model_path: str | Path | None = None,
     yolo_conf_thresh: float = 0.25,
     yolo_input_size: int | None = 960,
+    yolo_official_model_path: str | Path = "weights/yolo26n.pt",
+    yolo_official_classes: list[int] | None = None,
+    yolo_official_blur_ratio: float = 0.5,
     resize: int | None = None,
     detectors: Any = None,
 ) -> dict:
@@ -457,7 +504,9 @@ def blur_video(
         lp=lp,
     )
     device = _get_device()
-    face_det = lp_det = yolo_model = None
+    face_det = lp_det = None
+    yolo_detectors = None
+    official_blurrer = None
 
     if backend == "egoblur":
         if detectors is not None:
@@ -472,18 +521,27 @@ def blur_video(
             )
     elif backend == "yolo":
         if detectors is not None:
-            yolo_model = detectors
+            yolo_detectors = detectors
         else:
-            yolo_model = _build_yolo_detector(yolo_model_path)
-        resolved_yolo_classes = _resolve_yolo_classes(
-            blur_targets,
-            face=face,
-            lp=lp,
-            model=yolo_model,
-        )
+            yolo_detectors = _build_yolo_detectors(
+                face_enabled=face_enabled,
+                lp_enabled=lp_enabled,
+                face_model_path=yolo_face_model_path,
+                lp_model_path=yolo_lp_model_path,
+            )
+    elif backend == "yolo_official":
+        if detectors is not None:
+            official_blurrer = detectors
+        else:
+            official_blurrer = _build_yolo_official_blurrer(
+                model_path=yolo_official_model_path,
+                classes=yolo_official_classes,
+                blur_ratio=yolo_official_blur_ratio,
+                conf_thresh=yolo_conf_thresh,
+            )
     else:
         raise ValueError(
-            f"Unsupported detector_backend={detector_backend!r}, expected 'egoblur' or 'yolo'"
+            f"Unsupported detector_backend={detector_backend!r}, expected 'egoblur', 'yolo', or 'yolo_official'"
         )
 
     cap = cv2.VideoCapture(str(video_path))
@@ -505,6 +563,10 @@ def blur_video(
             needs_resize = True
             scale_back_h = frame_h / det_h
             scale_back_w = frame_w / det_w
+    elif backend == "yolo":
+        det_h, det_w = frame_h, frame_w
+        needs_resize = False
+        scale_back_h = scale_back_w = 1.0
     else:
         det_h, det_w = frame_h, frame_w
         needs_resize = False
@@ -518,7 +580,11 @@ def blur_video(
     detect_desc = (
         "exact EgoBlur target, internal resize bypassed"
         if backend == "egoblur"
-        else f"YOLO imgsz={yolo_input_size or 'native'}"
+        else (
+            f"YOLO imgsz={yolo_input_size or 'native'}"
+            if backend == "yolo"
+            else f"Ultralytics ObjectBlurrer blur_ratio={yolo_official_blur_ratio}"
+        )
     )
 
     log.info(
@@ -545,14 +611,46 @@ def blur_video(
 
             if backend == "egoblur":
                 boxes = _detect_frame(det_frame, face_det, lp_det, device)
+            elif backend == "yolo":
+                boxes = []
+                if face_enabled and yolo_detectors["face_model"] is not None:
+                    boxes.extend(
+                        _detect_frame_yolo(
+                            det_frame,
+                            yolo_detectors["face_model"],
+                            conf_thresh=yolo_conf_thresh,
+                            class_ids=None,
+                            input_size=yolo_input_size,
+                        )
+                    )
+                if lp_enabled and yolo_detectors["lp_model"] is not None:
+                    boxes.extend(
+                        _detect_frame_yolo(
+                            det_frame,
+                            yolo_detectors["lp_model"],
+                            conf_thresh=yolo_conf_thresh,
+                            class_ids=None,
+                            input_size=yolo_input_size,
+                        )
+                    )
+                boxes = _dedupe_boxes(boxes)
             else:
-                boxes = _detect_frame_yolo(
-                    det_frame,
-                    yolo_model,
-                    conf_thresh=yolo_conf_thresh,
-                    class_ids=resolved_yolo_classes,
-                    input_size=yolo_input_size,
-                )
+                results = official_blurrer(det_frame)
+                bgr = results.plot_im
+                detected_count = int(getattr(results, "total_tracks", 0) or 0)
+                if detected_count > 0:
+                    total_detections += detected_count
+                    frames_with_detections += 1
+                writer.stdin.write(bgr.tobytes())
+                frame_idx += 1
+                if frame_idx % 500 == 0:
+                    elapsed = time.time() - t_start
+                    log.info(
+                        f"  frame {frame_idx}/{total_frames} "
+                        f"({frame_idx / total_frames * 100:.0f}%), "
+                        f"{frame_idx / elapsed:.1f} fps"
+                    )
+                continue
 
             if boxes:
                 if needs_resize:
@@ -604,10 +702,15 @@ def blur_video(
         "scale_factor": scale,
     }
     if backend == "yolo":
-        summary["yolo_model_path"] = str(yolo_model_path)
+        summary["yolo_face_model_path"] = str(yolo_face_model_path) if yolo_face_model_path else None
+        summary["yolo_lp_model_path"] = str(yolo_lp_model_path) if yolo_lp_model_path else None
         summary["yolo_conf_thresh"] = yolo_conf_thresh
-        summary["resolved_yolo_classes"] = resolved_yolo_classes
         summary["yolo_input_size"] = yolo_input_size
+    elif backend == "yolo_official":
+        summary["yolo_official_model_path"] = str(yolo_official_model_path)
+        summary["yolo_official_classes"] = yolo_official_classes
+        summary["yolo_official_blur_ratio"] = yolo_official_blur_ratio
+        summary["yolo_conf_thresh"] = yolo_conf_thresh
 
     log.info(
         f"Done: {frame_idx} frames in {elapsed:.1f}s "
@@ -671,9 +774,13 @@ def main():
     parser.add_argument("--blur-targets", type=str, default="both", help="Blur targets: face | lp | both")
     parser.add_argument("--face-thresh", type=float, default=None, help="Face detection threshold")
     parser.add_argument("--lp-thresh", type=float, default=None, help="LP detection threshold")
-    parser.add_argument("--yolo-model-path", type=str, default="weights/yolo26n.pt", help="YOLO weights path")
+    parser.add_argument("--yolo-face-model-path", type=str, default=None, help="Dedicated YOLO face weights path")
+    parser.add_argument("--yolo-lp-model-path", type=str, default=None, help="Dedicated YOLO license-plate weights path")
     parser.add_argument("--yolo-conf-thresh", type=float, default=0.25, help="YOLO detection threshold")
     parser.add_argument("--yolo-input-size", type=int, default=960, help="YOLO imgsz")
+    parser.add_argument("--yolo-official-model-path", type=str, default="weights/yolo26n.pt", help="Official YOLO26 weights path for ObjectBlurrer")
+    parser.add_argument("--yolo-official-classes", type=int, nargs="*", default=None, help="Optional classes for ObjectBlurrer, e.g. --yolo-official-classes 0 2")
+    parser.add_argument("--yolo-official-blur-ratio", type=float, default=0.5, help="Ultralytics ObjectBlurrer blur_ratio")
     parser.add_argument("--preview", action="store_true", help="Generate side-by-side preview")
     args = parser.parse_args()
 
@@ -694,9 +801,13 @@ def main():
         blur_targets=args.blur_targets,
         scale=args.scale,
         face_thresh=args.face_thresh, lp_thresh=args.lp_thresh,
-        yolo_model_path=args.yolo_model_path,
+        yolo_face_model_path=args.yolo_face_model_path,
+        yolo_lp_model_path=args.yolo_lp_model_path,
         yolo_conf_thresh=args.yolo_conf_thresh,
         yolo_input_size=args.yolo_input_size,
+        yolo_official_model_path=args.yolo_official_model_path,
+        yolo_official_classes=args.yolo_official_classes,
+        yolo_official_blur_ratio=args.yolo_official_blur_ratio,
     )
 
     if args.preview:
