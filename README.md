@@ -154,6 +154,8 @@ DashScope 示例：
 export DASHSCOPE_API_KEY=你的Key
 ```
 
+如果不想分平台单独配环境变量，也可以统一使用 `VLM_API_KEY`；当前 provider 下若未设置专用环境变量，会回退到它。
+
 如果你想切到火山方舟 `doubao-seed-2-0-lite-260215`，可以改成：
 
 ```bash
@@ -166,7 +168,7 @@ export VLM_DEFAULT_MODEL=doubao-seed-2-0-lite-260215
 
 ```yaml
 vlm_api_provider: volcengine_ark
-ark_api_key: "你的Key"
+vlm_api_key: "你的Key"
 vlm_default_model: doubao-seed-2-0-lite-260215
 ```
 

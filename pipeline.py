@@ -101,24 +101,12 @@ class Pipeline:
         self.parallel: bool = config.get("parallel", True)
 
         # Allow YAML config to supply the API key without overriding an existing env var.
-        api_key = config.get("dashscope_api_key", "")
-        if api_key and not os.environ.get("DASHSCOPE_API_KEY"):
-            os.environ["DASHSCOPE_API_KEY"] = api_key
         vlm_api_key = config.get("vlm_api_key", "")
         if vlm_api_key and not os.environ.get("VLM_API_KEY"):
             os.environ["VLM_API_KEY"] = vlm_api_key
-        ark_api_key = config.get("ark_api_key", "")
-        if ark_api_key and not os.environ.get("ARK_API_KEY"):
-            os.environ["ARK_API_KEY"] = ark_api_key
         vlm_provider = str(config.get("vlm_api_provider", "")).strip()
         if vlm_provider and not os.environ.get("VLM_API_PROVIDER"):
             os.environ["VLM_API_PROVIDER"] = vlm_provider
-        vlm_base_url = str(config.get("vlm_base_url", "")).strip()
-        if vlm_base_url and not os.environ.get("VLM_BASE_URL"):
-            os.environ["VLM_BASE_URL"] = vlm_base_url
-        ark_base_url = str(config.get("ark_base_url", "")).strip()
-        if ark_base_url and not os.environ.get("ARK_BASE_URL"):
-            os.environ["ARK_BASE_URL"] = ark_base_url
         vlm_default_model = str(config.get("vlm_default_model", "")).strip()
         if vlm_default_model and not os.environ.get("VLM_DEFAULT_MODEL"):
             os.environ["VLM_DEFAULT_MODEL"] = vlm_default_model

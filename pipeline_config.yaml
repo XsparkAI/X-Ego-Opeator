@@ -19,26 +19,58 @@ episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/test_episode_30s"
 # 每个 episode 内输入视频的相对路径。
 input_video_path: rgb.mp4
 
-# ── VLM API 配置 ─────────────────────────────────────────────────── 
+# ── VLM API 配置 ───────────────────────────────────────────────────
 # 所有 VLM 算子统一走 operators/caption/vlm_api.py 这一层。
-# 可选 provider:
-#   - dashscope
-#   - volcengine_ark
 # 环境变量优先级高于这里的 YAML 配置。
+# 支持直接设置 provider 专用环境变量：
+#   - DashScope: DASHSCOPE_API_KEY
+#   - 方舟:      ARK_API_KEY
+# 如果对应 provider 的专用环境变量未设置，才会回退到通用的 VLM_API_KEY / vlm_api_key。
+#
+# provider 决定“全局走哪个 VLM 平台”，修改它会影响所有调用 get_api_key()/get_base_url() 的 VLM 算子。
+# 当前支持：
+#   - dashscope      : 阿里云百炼兼容 OpenAI 接口，适合跑 Qwen
+#   - volcengine_ark : 火山方舟 Responses API，适合跑 Doubao
+#
+# 常见配置：
+#   Qwen（DashScope）:
+#     vlm_api_provider: dashscope
+#     vlm_api_key: "你的 Key"
+#     vlm_default_model: qwen3.5-plus
+#   Doubao（方舟）:
+#     vlm_api_provider: volcengine_ark
+#     vlm_api_key: "你的 Key"
+#     vlm_default_model: doubao-seed-2-0-lite-250821
+#
+# 留空时的默认值：
+#   vlm_api_provider 为空 -> 默认 dashscope
+#   vlm_default_model 为空 -> 各任务使用自己的 fallback：
+#     caption -> qwen3.5-plus
+#     scene   -> qwen3.5-flash
+#     hand    -> qwen3.5-flash
+#   vlm_caption_model / vlm_hand_model / vlm_scene_model 为空 -> 各自回退到 vlm_default_model；若 vlm_default_model 也为空，再回退到上面的任务默认值
+#
+# 哪些参数会影响“全局 VLM 行为”：
+#   - vlm_api_provider : 全局切换 provider
+#   - vlm_api_key      : 当前 provider 的通用 key
+#   - vlm_default_model: 未被任务级模型覆盖时，所有 VLM 任务共用的默认模型
+#
+# 哪些参数只影响局部任务：
+#   - vlm_caption_model : 只影响 caption / video_segmentation 相关算子
+#   - vlm_hand_model    : 只影响 hand_analysis(method=vlm)
+#   - vlm_scene_model   : 只影响 scene classifier
+#
+# 当前限制：
+#   - 不支持按任务混用 provider
+#   - 也就是说，不能让 caption 走 Qwen(DashScope)，同时让 hand / scene 走 Doubao(方舟)
+#   - vlm_caption_model / vlm_hand_model / vlm_scene_model 只能覆盖“模型名”，不会切换各自的 provider
+#   - provider 始终由全局的 vlm_api_provider 决定
 vlm_api_provider: dashscope
-vlm_api_key: ""          # 通用 key；如 provider=dashscope 可替代 dashscope_api_key
-vlm_base_url: ""         # 通用 base url；留空则按 provider 使用默认值
-vlm_default_model: ""    # 全局默认模型；留空则使用各模块默认值
-vlm_caption_model: ""    # 可选：覆盖 video_segmentation / caption 相关模型
-vlm_hand_model: ""       # 可选：覆盖 hand_analysis(method=vlm) 模型
-vlm_scene_model: ""      # 可选：覆盖 scene classifier 模型
-
-# DashScope 兼容旧配置。
-dashscope_api_key: ""
-
-# 方舟可单独配置，便于切换 doubao 等模型。
-ark_api_key: ""
-ark_base_url: ""
+vlm_api_key: ""          # 通用 key。provider=dashscope 时用于 Qwen；provider=volcengine_ark 时用于 Doubao
+vlm_default_model: ""    # 全局默认模型。留空则由各任务回退到自己的内置默认值
+vlm_caption_model: ""    # 任务级覆盖。留空 -> 先用 vlm_default_model；若仍为空则用 qwen3.5-plus
+vlm_hand_model: ""       # 任务级覆盖。留空 -> 先用 vlm_default_model；若仍为空则用 qwen3.5-flash
+vlm_scene_model: ""      # 任务级覆盖。留空 -> 先用 vlm_default_model；若仍为空则用 qwen3.5-flash
 
 # 所有 VLM 算子共享的总 API 并发上限。
 # 目前主要由 video_segmentation 与 hand_analysis(method=vlm) 共享。
@@ -86,7 +118,7 @@ execution_mode: pipeline
 # 若完全省略某个算子配置块，则使用默认值（即 enabled: true）。
 #
 # 当前依赖关系摘要：
-#   frame_cache -> video_segmentation / ha # 说明：
+#   frame_cache -> video_segmentation / hand_analysis # 说明：
     #   egoblur 后端会直接启用/关闭对应检测器；
     #   yolo 后端会根据模型类别名自动匹配目标，若模型里没有 face / plate 类别，则不会命中nd_analysis / vidfakseo_quality
 #   video_segmentation -> segment_cut
@@ -168,8 +200,8 @@ operators:
     #   "sampling_expand"  — 先抽样检测，命中后向前/向后补扫连续区间（当前默认）
     #   "legacy_per_frame" — 旧版逐帧读取原视频并逐帧检测/写出
     detection_mode: sampling_expand
-    frame_sampling_step: 1   # 每隔 N 帧做一次抽样检测；命中后向前/向后逐帧补扫并覆盖连续出现帧
-    use_frame_cache: false   # 仅 detector_backend=yolo 时生效；优先复用 .frame_cache/vlm_640x480_q85
+    frame_sampling_step: 30   # 每隔 N 帧做一次抽样检测；命中后向前/向后逐帧补扫并覆盖连续出现帧
+    use_frame_cache: true   # 仅 detector_backend=yolo 时生效；优先复用 .frame_cache/vlm_640x480_q85
     frame_cache_num_workers: 1  # use_frame_cache=true 且 CPU YOLO 时，可并行检测缓存帧
     face_thresh: 0.4      # 覆盖默认的人脸检测阈值
     lp_thresh: 0.3        # 覆盖默认的车牌检测阈值
@@ -177,7 +209,7 @@ operators:
     yolo_face_model_path: weights/yolov8s-face-lindevs.pt
     yolo_lp_model_path: weights/yolo_lp.pt
     yolo_conf_thresh: 0.25
-    yolo_input_size: 960
+    yolo_input_size: 640
 
   transcode:
     enabled: false           # 默认关闭

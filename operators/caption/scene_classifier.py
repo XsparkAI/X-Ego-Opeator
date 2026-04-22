@@ -26,7 +26,7 @@ try:
 except ImportError:
     from vlm_api import get_api_key, get_default_model
 
-MODEL = get_default_model("scene", fallback="qwen3.5-plus")
+MODEL = get_default_model("scene", fallback="qwen3.5-flash")
 EXTRA_BODY = {"enable_thinking": False}
 TARGET_W = 640
 TARGET_H = 480

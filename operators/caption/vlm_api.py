@@ -40,16 +40,8 @@ def get_api_key() -> str:
 def get_base_url() -> str:
     provider = get_vlm_provider()
     if provider == "volcengine_ark":
-        return (
-            os.getenv("ARK_BASE_URL", "").strip()
-            or os.getenv("VLM_BASE_URL", "").strip()
-            or DEFAULT_ARK_BASE_URL
-        )
-    return (
-        os.getenv("DASHSCOPE_BASE_URL", "").strip()
-        or os.getenv("VLM_BASE_URL", "").strip()
-        or DEFAULT_BASE_URL
-    )
+        return DEFAULT_ARK_BASE_URL
+    return DEFAULT_BASE_URL
 
 
 def get_default_model(task: str | None = None, fallback: str = DEFAULT_MODEL) -> str:
