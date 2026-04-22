@@ -22,6 +22,7 @@ CLI usage:
 import base64
 import json
 import logging
+import os
 import re
 import tempfile
 from collections import Counter
@@ -56,6 +57,7 @@ try:
         classify_video_scene_direct,
         collect_scene_classification,
         submit_scene_classification,
+        sample_scene_frame_ids,
     )
 except ImportError:
     from scene_classifier import (
@@ -63,7 +65,15 @@ except ImportError:
         classify_video_scene_direct,
         collect_scene_classification,
         submit_scene_classification,
+        sample_scene_frame_ids,
     )
+try:
+    from ..frame_cache.frame_provider import FrameProvider
+except ImportError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from frame_cache.frame_provider import FrameProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -106,13 +116,21 @@ class Window:
     frame_ids: list  # Sampled frame indices within this window
 
 
-def build_windows(fps: float, nframes: int) -> list[Window]:
+def build_windows(
+    fps: float,
+    nframes: int,
+    *,
+    window_sec: float = WINDOW_SEC,
+    step_sec: float = STEP_SEC,
+    frames_per_window: int = FRAMES_PER_WINDOW,
+) -> list[Window]:
     """Build overlapping windows across the video."""
-    window_frames = int(WINDOW_SEC * fps)
-    step_frames = int(STEP_SEC * fps)
+    window_frames = max(1, int(round(window_sec * fps)))
+    step_frames = max(1, int(round(step_sec * fps)))
+    sample_count = max(1, int(frames_per_window))
 
     if nframes <= window_frames:
-        frame_ids = np.linspace(0, nframes - 1, FRAMES_PER_WINDOW, dtype=int).tolist()
+        frame_ids = np.linspace(0, nframes - 1, min(sample_count, nframes), dtype=int).tolist()
         return [Window(0, 0, nframes - 1, frame_ids)]
 
     windows = []
@@ -121,7 +139,7 @@ def build_windows(fps: float, nframes: int) -> list[Window]:
     while start < nframes:
         end = min(start + window_frames - 1, nframes - 1)
         actual_len = end - start + 1
-        n_samples = min(FRAMES_PER_WINDOW, actual_len)
+        n_samples = min(sample_count, actual_len)
         frame_ids = np.linspace(start, end, n_samples, dtype=int).tolist()
         windows.append(Window(wid, start, end, frame_ids))
         wid += 1
@@ -132,8 +150,18 @@ def build_windows(fps: float, nframes: int) -> list[Window]:
     return windows
 
 
-def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
+def extract_frames_b64(
+    video_path: str,
+    frame_ids: list[int],
+    *,
+    frame_provider: FrameProvider | None = None,
+) -> list[str]:
     """Extract specific frames from video as base64-encoded JPG strings."""
+    if frame_provider is not None:
+        cached = frame_provider.get_b64(frame_ids)
+        if cached:
+            return cached
+
     from ..frame_cache.cache_utils import ensure_cached_frame_b64
     from ..video_utils import get_manual_rotation, apply_rotation
 
@@ -221,20 +249,50 @@ Note: len(instructions) should be len(transitions) + 1.
 If transitions is empty, instructions should have exactly 1 element describing the whole segment."""
 
 
+def _extract_first_json_value(raw: str) -> object | None:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"[\{\[]", raw):
+        start = match.start()
+        try:
+            value, _ = decoder.raw_decode(raw[start:])
+            return value
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def _parse_vlm_json(raw: str | None) -> dict | None:
     if not raw:
         return None
-    json_match = re.search(r'\{.*\}', raw, re.DOTALL)
-    if not json_match:
-        return None
+
+    cleaned = str(raw).strip()
+    fence_match = re.search(r"```(?:json)?\s*(.*?)```", cleaned, re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+
     try:
-        return json.loads(json_match.group())
+        parsed = json.loads(cleaned)
     except json.JSONDecodeError:
-        return None
+        parsed = _extract_first_json_value(cleaned)
+
+    if isinstance(parsed, dict):
+        return parsed
+    if isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict):
+                return item
+    return None
 
 
-def vlm_analyze_windows_batch(video_path: str, windows: list[Window], fps: float, task_name: str | None = None) -> list[dict | None]:
-    requests = build_window_requests(video_path, windows, fps, task_name)
+def vlm_analyze_windows_batch(
+    video_path: str,
+    windows: list[Window],
+    fps: float,
+    task_name: str | None = None,
+    *,
+    frame_provider: FrameProvider | None = None,
+) -> list[dict | None]:
+    requests = build_window_requests(video_path, windows, fps, task_name, frame_provider=frame_provider)
     if not requests:
         return [None] * len(windows)
 
@@ -250,8 +308,10 @@ def vlm_analyze_windows_direct(
     fps: float,
     task_name: str | None = None,
     max_workers: int = 8,
+    *,
+    frame_provider: FrameProvider | None = None,
 ) -> list[dict | None]:
-    requests = build_window_requests(video_path, windows, fps, task_name)
+    requests = build_window_requests(video_path, windows, fps, task_name, frame_provider=frame_provider)
     if not requests:
         return [None] * len(windows)
 
@@ -270,10 +330,12 @@ def build_window_requests(
     windows: list[Window],
     fps: float,
     task_name: str | None = None,
+    *,
+    frame_provider: FrameProvider | None = None,
 ) -> list[dict]:
     requests: list[dict] = []
     for window in windows:
-        frames_b64 = extract_frames_b64(video_path, window.frame_ids)
+        frames_b64 = extract_frames_b64(video_path, window.frame_ids, frame_provider=frame_provider)
         if not frames_b64:
             continue
         prompt = build_window_prompt(len(frames_b64), window, fps, task_name)
@@ -287,12 +349,47 @@ def build_window_requests(
     return requests
 
 
+def _summarize_failed_response(custom_id: str, response: dict | None) -> str:
+    response = response or {}
+    error = response.get("error")
+    status = response.get("status_code")
+    text = str(response.get("text") or "").strip()
+    snippet = re.sub(r"\s+", " ", text)[:160]
+    parts = [custom_id]
+    if status:
+        parts.append(f"status={status}")
+    if error:
+        parts.append(f"error={error}")
+    if snippet:
+        parts.append(f"text={snippet}")
+    return " | ".join(parts)
+
+
 def parse_window_batch_responses(
     windows: list[Window],
     requests: list[dict],
     responses: dict[str, dict],
 ) -> list[dict | None]:
-    by_id = {req["custom_id"]: _parse_vlm_json(responses.get(req["custom_id"], {}).get("text")) for req in requests}
+    by_id: dict[str, dict | None] = {}
+    failed: list[str] = []
+    for req in requests:
+        custom_id = req["custom_id"]
+        response = responses.get(custom_id, {})
+        parsed = _parse_vlm_json(response.get("text"))
+        by_id[custom_id] = parsed
+        if parsed is None:
+            failed.append(_summarize_failed_response(custom_id, response))
+    if requests and len(failed) == len(requests):
+        sample = "; ".join(failed[:3])
+        raise RuntimeError(
+            f"All {len(requests)} caption window requests failed or returned unparsable JSON. Sample: {sample}"
+        )
+    if failed:
+        log.warning(
+            "segment_v2t: %s/%s window responses failed to parse",
+            len(failed),
+            len(requests),
+        )
     return [by_id.get(f"win_{window.window_id}") for window in windows]
 
 
@@ -300,7 +397,27 @@ def parse_window_results_map(
     windows: list[Window],
     responses: dict[str, dict],
 ) -> list[dict | None]:
-    return [_parse_vlm_json(responses.get(f"win_{window.window_id}", {}).get("text")) for window in windows]
+    results: list[dict | None] = []
+    failed: list[str] = []
+    for window in windows:
+        custom_id = f"win_{window.window_id}"
+        response = responses.get(custom_id, {})
+        parsed = _parse_vlm_json(response.get("text"))
+        results.append(parsed)
+        if parsed is None:
+            failed.append(_summarize_failed_response(custom_id, response))
+    if windows and len(failed) == len(windows):
+        sample = "; ".join(failed[:3])
+        raise RuntimeError(
+            f"All {len(windows)} collected caption window results were unparsable. Sample: {sample}"
+        )
+    if failed:
+        log.warning(
+            "segment_v2t: %s/%s collected window responses failed to parse",
+            len(failed),
+            len(windows),
+        )
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -475,19 +592,49 @@ def segment(
     cap.release()
 
     log.info(f"[{name}] {nframes} frames, {fps:.0f} fps, {nframes / fps:.1f}s")
+    frame_provider = FrameProvider(video_path.parent)
 
     # Build windows
-    windows = build_windows(fps, nframes)
+    windows = build_windows(
+        fps,
+        nframes,
+        window_sec=window_sec,
+        step_sec=step_sec,
+        frames_per_window=frames_per_window,
+    )
     log.info(f"[{name}] {len(windows)} windows (window={window_sec}s, step={step_sec}s, {frames_per_window} frames/win)")
+    frame_ids = [fid for window in windows for fid in window.frame_ids]
+    frame_ids.extend(sample_scene_frame_ids(nframes))
+    if frame_ids:
+        frame_provider.ensure_profile(frame_ids)
 
     mode_desc = "batch API" if batch_enabled else "direct API"
     log.info(f"[{name}] Submitting scene + {len(windows)} windows via {mode_desc}...")
     with ThreadPoolExecutor(max_workers=2) as pool:
         if batch_enabled:
-            future_scene = pool.submit(classify_video_scene, video_path, fps=fps, nframes=nframes)
-            future_windows = pool.submit(vlm_analyze_windows_batch, str(video_path), windows, fps, task_name)
+            future_scene = pool.submit(
+                classify_video_scene,
+                video_path,
+                fps=fps,
+                nframes=nframes,
+                frame_provider=frame_provider,
+            )
+            future_windows = pool.submit(
+                vlm_analyze_windows_batch,
+                str(video_path),
+                windows,
+                fps,
+                task_name,
+                frame_provider=frame_provider,
+            )
         else:
-            future_scene = pool.submit(classify_video_scene_direct, video_path, fps=fps, nframes=nframes)
+            future_scene = pool.submit(
+                classify_video_scene_direct,
+                video_path,
+                fps=fps,
+                nframes=nframes,
+                frame_provider=frame_provider,
+            )
             future_windows = pool.submit(
                 vlm_analyze_windows_direct,
                 str(video_path),
@@ -495,6 +642,7 @@ def segment(
                 fps,
                 task_name,
                 max_workers,
+                frame_provider=frame_provider,
             )
         scene = future_scene.result()
         window_results = future_windows.result()
@@ -538,13 +686,36 @@ def submit_segment_job(
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
+    frame_provider = FrameProvider(video_path.parent)
 
-    windows = build_windows(fps, nframes)
-    requests = build_window_requests(str(video_path), windows, fps, task_name)
+    windows = build_windows(
+        fps,
+        nframes,
+        window_sec=window_sec,
+        step_sec=step_sec,
+        frames_per_window=frames_per_window,
+    )
+    frame_ids = [fid for window in windows for fid in window.frame_ids]
+    frame_ids.extend(sample_scene_frame_ids(nframes))
+    if frame_ids:
+        frame_provider.ensure_profile(frame_ids)
+    requests = build_window_requests(
+        str(video_path),
+        windows,
+        fps,
+        task_name,
+        frame_provider=frame_provider,
+    )
 
     log.info(f"[{video_path.stem}] Submitting scene + {len(windows)} windows via batch API...")
     with ThreadPoolExecutor(max_workers=2) as pool:
-        future_scene = pool.submit(submit_scene_classification, video_path, fps=fps, nframes=nframes)
+        future_scene = pool.submit(
+            submit_scene_classification,
+            video_path,
+            fps=fps,
+            nframes=nframes,
+            frame_provider=frame_provider,
+        )
         future_windows = pool.submit(
             lambda: (
                 {"batch_id": None, "request_count": 0}

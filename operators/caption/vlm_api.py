@@ -107,6 +107,36 @@ def _extract_openai_usage_dict(response) -> dict[str, Any]:
     }
 
 
+def _extract_openai_payload_text(payload: dict[str, Any]) -> str | None:
+    choices = payload.get("choices") or []
+    if not choices:
+        return None
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        texts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if text:
+                    texts.append(str(text))
+        if texts:
+            return "\n".join(texts)
+    return str(content) if content is not None else None
+
+
+def _extract_openai_payload_usage_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    usage = payload.get("usage") or {}
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        "prompt_tokens": usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0) or 0,
+        "completion_tokens": usage.get("completion_tokens", 0) or usage.get("output_tokens", 0) or 0,
+    }
+
+
 def _convert_messages_to_ark_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     converted: list[dict[str, Any]] = []
     for message in messages:
@@ -164,26 +194,70 @@ def _submit_one_ark_request(
     model: str,
     extra_body: dict[str, Any] | None,
 ) -> tuple[str, dict[str, Any]]:
-    payload: dict[str, Any] = {
+    response_payload: dict[str, Any] = {
         "model": req.get("model", model),
         "input": _convert_messages_to_ark_input(req["messages"]),
     }
     # Some OpenAI-compatible extras used by other providers are not accepted by
     # Ark Responses API for multimodal requests. Keep the upper-layer contract
     # stable by silently dropping them here.
+    try:
+        response = client.post(
+            f"{get_base_url().rstrip('/')}/responses",
+            headers={"Authorization": f"Bearer {get_api_key()}"},
+            json=response_payload,
+        )
+        response.raise_for_status()
+        body = response.json()
+        return req["custom_id"], {
+            "text": _extract_ark_response_text(body),
+            "usage": _extract_ark_usage_dict(body),
+            "status_code": response.status_code,
+        }
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 404:
+            raise
 
+    log.warning(
+        "Ark /responses is unavailable for %s; retrying %s via /chat/completions",
+        req["custom_id"],
+        req.get("model", model),
+    )
+    chat_payload: dict[str, Any] = {
+        "model": req.get("model", model),
+        "messages": req["messages"],
+    }
+    body_extra = req.get("extra_body") or extra_body or {}
+    if body_extra:
+        chat_payload.update(body_extra)
     response = client.post(
-        f"{get_base_url().rstrip('/')}/responses",
+        f"{get_base_url().rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {get_api_key()}"},
-        json=payload,
+        json=chat_payload,
     )
     response.raise_for_status()
     body = response.json()
     return req["custom_id"], {
-        "text": _extract_ark_response_text(body),
-        "usage": _extract_ark_usage_dict(body),
+        "text": _extract_openai_payload_text(body),
+        "usage": _extract_openai_payload_usage_dict(body),
         "status_code": response.status_code,
     }
+
+
+def _format_httpx_error(exc: Exception) -> str:
+    if not isinstance(exc, httpx.HTTPStatusError):
+        return str(exc)
+    response = exc.response
+    body_text = ""
+    try:
+        raw = response.text.strip()
+        if raw:
+            body_text = raw[:400]
+    except Exception:
+        body_text = ""
+    if body_text:
+        return f"{exc}; body={body_text}"
+    return str(exc)
 
 
 def submit_batch_chat_requests_async(
@@ -427,7 +501,7 @@ def submit_direct_chat_requests(
                         "text": None,
                         "usage": None,
                         "status_code": 500,
-                        "error": str(e),
+                        "error": _format_httpx_error(e),
                     }
     finally:
         if hasattr(client, "close"):

@@ -22,8 +22,8 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
-import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -65,6 +65,7 @@ try:
         classify_video_scene_direct,
         collect_scene_classification,
         submit_scene_classification,
+        sample_scene_frame_ids,
     )
 except ImportError:
     from scene_classifier import (
@@ -72,7 +73,15 @@ except ImportError:
         classify_video_scene_direct,
         collect_scene_classification,
         submit_scene_classification,
+        sample_scene_frame_ids,
     )
+try:
+    from ..frame_cache.frame_provider import FrameProvider
+except ImportError:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from frame_cache.frame_provider import FrameProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -196,7 +205,17 @@ def save_frames_as_tmp_jpg(video_path: str | Path, frame_ids: list[int], tmp_dir
     return paths
 
 
-def extract_frames_b64(video_path: str, frame_ids: list[int]) -> list[str]:
+def extract_frames_b64(
+    video_path: str,
+    frame_ids: list[int],
+    *,
+    frame_provider: FrameProvider | None = None,
+) -> list[str]:
+    if frame_provider is not None:
+        cached = frame_provider.get_b64(frame_ids)
+        if cached:
+            return cached
+
     try:
         from ..frame_cache.cache_utils import ensure_cached_frame_b64
     except ImportError:
@@ -301,8 +320,13 @@ Output ONLY valid JSON:
 }}"""
 
 
-def run_window_batch(video_path: str | Path, jobs: list[dict[str, Any]]) -> list[dict | None]:
-    requests = build_window_requests(video_path, jobs)
+def run_window_batch(
+    video_path: str | Path,
+    jobs: list[dict[str, Any]],
+    *,
+    frame_provider: FrameProvider | None = None,
+) -> list[dict | None]:
+    requests = build_window_requests(video_path, jobs, frame_provider=frame_provider)
     if not requests:
         return [None] * len(jobs)
 
@@ -317,8 +341,9 @@ def run_window_direct(
     jobs: list[dict[str, Any]],
     *,
     max_workers: int = 8,
+    frame_provider: FrameProvider | None = None,
 ) -> list[dict | None]:
-    requests = build_window_requests(video_path, jobs)
+    requests = build_window_requests(video_path, jobs, frame_provider=frame_provider)
     if not requests:
         return [None] * len(jobs)
 
@@ -332,10 +357,19 @@ def run_window_direct(
     return parse_window_results(jobs, responses)
 
 
-def build_window_requests(video_path: str | Path, jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_window_requests(
+    video_path: str | Path,
+    jobs: list[dict[str, Any]],
+    *,
+    frame_provider: FrameProvider | None = None,
+) -> list[dict[str, Any]]:
     requests = []
     for job in jobs:
-        frames_b64 = extract_frames_b64(str(video_path), job["frame_ids"])
+        frames_b64 = extract_frames_b64(
+            str(video_path),
+            job["frame_ids"],
+            frame_provider=frame_provider,
+        )
         if not frames_b64:
             continue
         requests.append(
@@ -610,6 +644,7 @@ def segment(
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     fps, nframes = read_video_info(video_path)
+    frame_provider = FrameProvider(video_path.parent)
 
     task_windows = build_windows_for_range(
         fps,
@@ -630,18 +665,27 @@ def segment(
         }
         for window in task_windows
     ]
+    task_frame_ids = [fid for job in task_jobs for fid in job["frame_ids"]]
+    task_frame_ids.extend(sample_scene_frame_ids(nframes))
+    if task_frame_ids:
+        frame_provider.ensure_profile(task_frame_ids)
     with ThreadPoolExecutor(max_workers=2) as pool:
         future_scene = pool.submit(
             classify_video_scene if batch_enabled else classify_video_scene_direct,
             video_path,
             fps=fps,
             nframes=nframes,
+            frame_provider=frame_provider,
         )
         future_tasks = pool.submit(
             run_window_batch if batch_enabled else run_window_direct,
             video_path,
             task_jobs,
-            **({} if batch_enabled else {"max_workers": max_workers}),
+            **(
+                {"frame_provider": frame_provider}
+                if batch_enabled
+                else {"max_workers": max_workers, "frame_provider": frame_provider}
+            ),
         )
         scene = future_scene.result()
         task_results = future_tasks.result()
@@ -659,14 +703,13 @@ def segment(
     task_segments = _vlm_refine_tasks(task_segments, batch_enabled=batch_enabled)
 
     output_tasks = [None] * len(task_segments)
-
-    def _process_task(task_idx_seg: tuple[int, dict]) -> tuple[int, dict]:
-        task_idx, task_seg = task_idx_seg
+    task_action_contexts: list[tuple[int, dict, list[Window], list[dict[str, Any]]]] = []
+    action_frame_ids: list[int] = []
+    for task_idx, task_seg in enumerate(task_segments):
         task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
         task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
         seg_start = task_seg["start_frame"]
         seg_end = task_seg["end_frame"]
-
         action_windows = build_windows_for_range(
             fps,
             seg_start,
@@ -683,11 +726,32 @@ def segment(
             }
             for window in action_windows
         ]
+        task_action_contexts.append((task_idx, task_seg, action_windows, action_jobs))
+        for job in action_jobs:
+            action_frame_ids.extend(job["frame_ids"])
+    if action_frame_ids:
+        frame_provider.ensure_profile(action_frame_ids)
+
+    def _process_task(task_ctx: tuple[int, dict, list[Window], list[dict[str, Any]]]) -> tuple[int, dict]:
+        task_idx, task_seg, action_windows, action_jobs = task_ctx
+        task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
+        task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
+        seg_start = task_seg["start_frame"]
+        seg_end = task_seg["end_frame"]
         if action_jobs:
             if batch_enabled:
-                action_results = run_window_batch(video_path, action_jobs)
+                action_results = run_window_batch(
+                    video_path,
+                    action_jobs,
+                    frame_provider=frame_provider,
+                )
             else:
-                action_results = run_window_direct(video_path, action_jobs, max_workers=max_workers)
+                action_results = run_window_direct(
+                    video_path,
+                    action_jobs,
+                    max_workers=max_workers,
+                    frame_provider=frame_provider,
+                )
         else:
             action_results = []
 
@@ -722,7 +786,7 @@ def segment(
 
     if task_segments:
         with ThreadPoolExecutor(max_workers=min(max(1, max_workers), len(task_segments))) as pool:
-            for task_idx, task_output in pool.map(_process_task, enumerate(task_segments)):
+            for task_idx, task_output in pool.map(_process_task, task_action_contexts):
                 output_tasks[task_idx] = task_output
 
     return {
@@ -755,6 +819,7 @@ def submit_segment_job(
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     fps, nframes = read_video_info(video_path)
+    frame_provider = FrameProvider(video_path.parent)
     task_windows = build_windows_for_range(
         fps,
         0,
@@ -771,11 +836,21 @@ def submit_segment_job(
         }
         for window in task_windows
     ]
-    task_requests = build_window_requests(video_path, task_jobs)
+    task_frame_ids = [fid for job in task_jobs for fid in job["frame_ids"]]
+    task_frame_ids.extend(sample_scene_frame_ids(nframes))
+    if task_frame_ids:
+        frame_provider.ensure_profile(task_frame_ids)
+    task_requests = build_window_requests(video_path, task_jobs, frame_provider=frame_provider)
 
     log.info("[%s] Submitting scene + task analysis on %s windows", video_path.stem, len(task_windows))
     with ThreadPoolExecutor(max_workers=2) as pool:
-        future_scene = pool.submit(submit_scene_classification, video_path, fps=fps, nframes=nframes)
+        future_scene = pool.submit(
+            submit_scene_classification,
+            video_path,
+            fps=fps,
+            nframes=nframes,
+            frame_provider=frame_provider,
+        )
         future_tasks = pool.submit(
             lambda: (
                 {"batch_id": None, "request_count": 0}
@@ -809,11 +884,17 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
     video_path = Path(state["video_path"])
     fps = float(state["fps"])
     nframes = int(state["nframes"])
+    frame_provider = FrameProvider(video_path.parent)
 
     task_windows = [Window(**window) for window in state.get("task_windows", [])]
     task_jobs = state.get("task_jobs", [])
     scene_submission = state.get("scene_submission")
     task_submission = state.get("task_submission") or {}
+
+    task_frame_ids = [fid for job in task_jobs for fid in job.get("frame_ids", [])]
+    task_frame_ids.extend(sample_scene_frame_ids(nframes))
+    if task_frame_ids:
+        frame_provider.ensure_profile(task_frame_ids)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         future_scene = pool.submit(
@@ -847,14 +928,13 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
     )
 
     output_tasks = [None] * len(task_segments)
-
-    def _process_task(task_idx_seg: tuple[int, dict]) -> tuple[int, dict]:
-        task_idx, task_seg = task_idx_seg
+    task_action_contexts: list[tuple[int, dict, list[Window], list[dict[str, Any]]]] = []
+    action_frame_ids: list[int] = []
+    for task_idx, task_seg in enumerate(task_segments):
         task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
         task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
         seg_start = task_seg["start_frame"]
         seg_end = task_seg["end_frame"]
-
         action_windows = build_windows_for_range(
             fps,
             seg_start,
@@ -871,7 +951,23 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
             }
             for window in action_windows
         ]
-        action_requests = build_window_requests(video_path, action_jobs)
+        task_action_contexts.append((task_idx, task_seg, action_windows, action_jobs))
+        for job in action_jobs:
+            action_frame_ids.extend(job["frame_ids"])
+    if action_frame_ids:
+        frame_provider.ensure_profile(action_frame_ids)
+
+    def _process_task(task_ctx: tuple[int, dict, list[Window], list[dict[str, Any]]]) -> tuple[int, dict]:
+        task_idx, task_seg, action_windows, action_jobs = task_ctx
+        task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
+        task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
+        seg_start = task_seg["start_frame"]
+        seg_end = task_seg["end_frame"]
+        action_requests = build_window_requests(
+            video_path,
+            action_jobs,
+            frame_provider=frame_provider,
+        )
         if action_requests:
             with vlm_api_slot():
                 action_submission = submit_batch_chat_requests_async(action_requests, model=MODEL, extra_body=EXTRA_BODY)
@@ -917,7 +1013,7 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
 
     if task_segments:
         with ThreadPoolExecutor(max_workers=min(max(1, int(state["max_workers"])), len(task_segments))) as pool:
-            for task_idx, task_output in pool.map(_process_task, enumerate(task_segments)):
+            for task_idx, task_output in pool.map(_process_task, task_action_contexts):
                 output_tasks[task_idx] = task_output
 
     log.info("[%s] Scene: %s", video_path.stem, scene)

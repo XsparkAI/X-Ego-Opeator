@@ -6,7 +6,7 @@ import base64
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import cv2
 import numpy as np
@@ -33,6 +33,17 @@ class CaptionSamplingSpec:
     frames_per_window: int
 
 
+@dataclass
+class TaskActionSamplingSpec:
+    task_window_sec: float
+    task_step_sec: float
+    task_frames_per_window: int
+    action_window_sec: float
+    action_step_sec: float
+    action_frames_per_window: int
+    scene_frames: int = 16
+
+
 def probe_video(video_path: Path) -> tuple[float, int]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -48,27 +59,110 @@ def build_caption_frame_ids(
     nframes: int,
     spec: CaptionSamplingSpec,
 ) -> list[int]:
-    window_frames = int(spec.window_sec * fps)
-    step_frames = int(spec.step_sec * fps)
-    frames_per_window = max(1, spec.frames_per_window)
+    return build_window_frame_ids_for_range(
+        fps,
+        0,
+        nframes,
+        window_sec=spec.window_sec,
+        step_sec=spec.step_sec,
+        frames_per_window=spec.frames_per_window,
+    )
 
+
+def build_uniform_frame_ids(
+    nframes: int,
+    num_samples: int,
+) -> list[int]:
+    if nframes <= 0 or num_samples <= 0:
+        return []
+    return np.linspace(0, nframes - 1, min(num_samples, nframes), dtype=int).tolist()
+
+
+def build_window_frame_ids_for_range(
+    fps: float,
+    start_frame: int,
+    end_frame: int,
+    *,
+    window_sec: float,
+    step_sec: float,
+    frames_per_window: int,
+) -> list[int]:
+    start_frame = max(0, int(start_frame))
+    end_frame = max(start_frame, int(end_frame))
+    nframes = end_frame - start_frame
     if nframes <= 0:
         return []
 
+    window_frames = max(1, int(round(window_sec * fps)))
+    step_frames = max(1, int(round(step_sec * fps)))
+    sample_count = max(1, int(frames_per_window))
+
     if nframes <= window_frames:
-        return np.linspace(0, nframes - 1, frames_per_window, dtype=int).tolist()
+        return np.linspace(
+            start_frame,
+            end_frame - 1,
+            min(sample_count, nframes),
+            dtype=int,
+        ).tolist()
 
     frame_ids: list[int] = []
-    start = 0
-    while start < nframes:
-        end = min(start + window_frames - 1, nframes - 1)
-        actual_len = end - start + 1
-        n_samples = min(frames_per_window, actual_len)
-        frame_ids.extend(np.linspace(start, end, n_samples, dtype=int).tolist())
-        start += step_frames
-        if end == nframes - 1:
+    current = start_frame
+    while current < end_frame:
+        window_end = min(current + window_frames, end_frame)
+        actual_len = window_end - current
+        if actual_len <= 0:
             break
+        frame_ids.extend(
+            np.linspace(
+                current,
+                window_end - 1,
+                min(sample_count, actual_len),
+                dtype=int,
+            ).tolist()
+        )
+        if window_end >= end_frame:
+            break
+        current += step_frames
     return frame_ids
+
+
+def build_task_action_frame_ids(
+    fps: float,
+    nframes: int,
+    spec: TaskActionSamplingSpec,
+    *,
+    task_segments: Iterable[tuple[int, int]] | None = None,
+    include_scene: bool = False,
+) -> list[int]:
+    frame_ids: set[int] = set()
+    frame_ids.update(
+        build_window_frame_ids_for_range(
+            fps,
+            0,
+            nframes,
+            window_sec=spec.task_window_sec,
+            step_sec=spec.task_step_sec,
+            frames_per_window=spec.task_frames_per_window,
+        )
+    )
+
+    if task_segments:
+        for seg_start, seg_end in task_segments:
+            frame_ids.update(
+                build_window_frame_ids_for_range(
+                    fps,
+                    seg_start,
+                    seg_end,
+                    window_sec=spec.action_window_sec,
+                    step_sec=spec.action_step_sec,
+                    frames_per_window=spec.action_frames_per_window,
+                )
+            )
+
+    if include_scene:
+        frame_ids.update(build_uniform_frame_ids(nframes, spec.scene_frames))
+
+    return sorted(frame_ids)
 
 
 def build_stride_frame_ids(nframes: int, frame_step: int) -> list[int]:
@@ -211,45 +305,57 @@ def _build_transformed_cache(
     video_path = resolve_episode_video_path(episode_dir)
     fps, total_frames = probe_video(video_path)
     wanted = sorted({fid for fid in frame_ids if 0 <= fid < total_frames})
+    manifest = load_manifest(episode_dir) or {}
+    existing_profile = manifest.get("profiles", {}).get(profile, {})
 
     root = cache_root(episode_dir)
     prof_dir = profile_dir(episode_dir, profile)
     root.mkdir(exist_ok=True)
     prof_dir.mkdir(exist_ok=True)
 
+    existing_ids = {
+        int(fid)
+        for fid in existing_profile.get("frame_ids", [])
+        if isinstance(fid, int) and (prof_dir / f"frame_{fid:06d}{suffix}").exists()
+    }
+    missing = [fid for fid in wanted if fid not in existing_ids]
+
     rotation = get_manual_rotation(str(video_path)) if apply_manual_rotation else 0
-    cap = cv2.VideoCapture(str(video_path))
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Cannot open video: {video_path}")
+    written_ids: set[int] = set()
+    cached_shape = existing_profile.get("cached_size")
 
-    saved = 0
-    wanted_idx = 0
-    current_frame = 0
-    cached_shape: list[int] | None = None
+    if missing:
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            raise FileNotFoundError(f"Cannot open video: {video_path}")
 
-    while wanted_idx < len(wanted):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        target = wanted[wanted_idx]
-        if current_frame == target:
-            if apply_manual_rotation:
-                frame = apply_rotation(frame, rotation)
-            frame = transform(frame)
-            if cached_shape is None:
-                cached_shape = [int(frame.shape[1]), int(frame.shape[0])]
-            out_path = prof_dir / f"frame_{target:06d}{suffix}"
-            ok = cv2.imwrite(str(out_path), frame, imwrite_params or [])
-            if ok:
-                saved += 1
-            wanted_idx += 1
-        current_frame += 1
+        wanted_idx = 0
+        current_frame = 0
+        while wanted_idx < len(missing):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            target = missing[wanted_idx]
+            if current_frame == target:
+                if apply_manual_rotation:
+                    frame = apply_rotation(frame, rotation)
+                frame = transform(frame)
+                if cached_shape is None:
+                    cached_shape = [int(frame.shape[1]), int(frame.shape[0])]
+                out_path = prof_dir / f"frame_{target:06d}{suffix}"
+                ok = cv2.imwrite(str(out_path), frame, imwrite_params or [])
+                if ok:
+                    written_ids.add(target)
+                wanted_idx += 1
+            current_frame += 1
 
-    cap.release()
+        cap.release()
+
+    cached_ids = sorted(existing_ids.union(written_ids))
 
     profile_info = {
-        "frame_count": saved,
-        "frame_ids": wanted,
+        "frame_count": len(cached_ids),
+        "frame_ids": cached_ids,
     }
     if cached_shape is not None:
         profile_info["cached_size"] = cached_shape

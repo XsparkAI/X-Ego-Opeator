@@ -11,8 +11,10 @@ from ..video_path import resolve_episode_video_path
 from ..vlm_limit import cpu_task_slot
 from .cache_utils import (
     CaptionSamplingSpec,
+    TaskActionSamplingSpec,
     build_cache,
     build_caption_frame_ids,
+    build_task_action_frame_ids,
     build_quality_cache,
     build_sample_fps_frame_ids,
     build_stride_frame_ids,
@@ -25,9 +27,17 @@ log = logging.getLogger(__name__)
 @dataclass
 class FrameCacheConfig:
     include_caption: bool = False
+    caption_method: str = "segment_v2t"
     caption_window_sec: float = 10.0
     caption_step_sec: float = 5.0
     caption_frames_per_window: int = 12
+    caption_task_window_sec: float = 12.0
+    caption_task_step_sec: float = 6.0
+    caption_task_frames_per_window: int = 12
+    caption_action_window_sec: float = 6.0
+    caption_action_step_sec: float = 3.0
+    caption_action_frames_per_window: int = 8
+    caption_scene_frames: int = 16
     include_hand_vlm: bool = False
     hand_frame_step: int = 120
     include_video_quality: bool = False
@@ -54,17 +64,35 @@ class FrameCacheOperator:
             wanted: set[int] = set()
 
             if self.config.include_caption:
-                wanted.update(
-                    build_caption_frame_ids(
-                        fps,
-                        total_frames,
-                        CaptionSamplingSpec(
-                            window_sec=self.config.caption_window_sec,
-                            step_sec=self.config.caption_step_sec,
-                            frames_per_window=self.config.caption_frames_per_window,
-                        ),
+                if str(self.config.caption_method).lower() == "task_action_v2t":
+                    wanted.update(
+                        build_task_action_frame_ids(
+                            fps,
+                            total_frames,
+                            TaskActionSamplingSpec(
+                                task_window_sec=self.config.caption_task_window_sec,
+                                task_step_sec=self.config.caption_task_step_sec,
+                                task_frames_per_window=self.config.caption_task_frames_per_window,
+                                action_window_sec=self.config.caption_action_window_sec,
+                                action_step_sec=self.config.caption_action_step_sec,
+                                action_frames_per_window=self.config.caption_action_frames_per_window,
+                                scene_frames=self.config.caption_scene_frames,
+                            ),
+                            include_scene=True,
+                        )
                     )
-                )
+                else:
+                    wanted.update(
+                        build_caption_frame_ids(
+                            fps,
+                            total_frames,
+                            CaptionSamplingSpec(
+                                window_sec=self.config.caption_window_sec,
+                                step_sec=self.config.caption_step_sec,
+                                frames_per_window=self.config.caption_frames_per_window,
+                            ),
+                        )
+                    )
 
             if self.config.include_hand_vlm:
                 wanted.update(build_stride_frame_ids(total_frames, self.config.hand_frame_step))

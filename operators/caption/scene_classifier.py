@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import re
-import tempfile
 from pathlib import Path
 
 import cv2
@@ -121,6 +119,7 @@ def build_scene_request(
     fps: float | None = None,
     nframes: int | None = None,
     num_samples: int = SCENE_FRAMES,
+    frame_provider=None,
 ) -> dict[str, object] | None:
     try:
         from .vlm_api import build_multimodal_message
@@ -144,12 +143,21 @@ def build_scene_request(
         return None
 
     duration_sec = (nframes / fps) if fps and nframes else None
+    image_b64_list: list[str]
+    if frame_provider is not None:
+        image_b64_list = frame_provider.get_b64(frame_ids)
+    else:
+        try:
+            from ..frame_cache.cache_utils import ensure_cached_frame_b64
+        except ImportError:
+            import sys
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        frame_paths = save_scene_frames_as_tmp_jpg(video_path, frame_ids, tmp_dir)
-        if not frame_paths:
-            return None
-        image_b64_list = [base64.b64encode(Path(p).read_bytes()).decode("ascii") for p in frame_paths]
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+            from frame_cache.cache_utils import ensure_cached_frame_b64
+
+        image_b64_list = ensure_cached_frame_b64(video_path.parent, frame_ids) or []
+    if not image_b64_list:
+        return None
 
     return {
         "custom_id": f"scene__{video_path.stem}",
@@ -175,12 +183,19 @@ def submit_scene_classification(
     fps: float | None = None,
     nframes: int | None = None,
     num_samples: int = SCENE_FRAMES,
+    frame_provider=None,
 ) -> dict[str, object] | None:
     if not get_api_key():
         log.warning("Scene classification skipped: VLM API key is not set")
         return None
 
-    request = build_scene_request(video_path, fps=fps, nframes=nframes, num_samples=num_samples)
+    request = build_scene_request(
+        video_path,
+        fps=fps,
+        nframes=nframes,
+        num_samples=num_samples,
+        frame_provider=frame_provider,
+    )
     if request is None:
         return None
 
@@ -202,12 +217,19 @@ def classify_video_scene_direct(
     fps: float | None = None,
     nframes: int | None = None,
     num_samples: int = SCENE_FRAMES,
+    frame_provider=None,
 ) -> str:
     if not get_api_key():
         log.warning("Scene classification skipped: VLM API key is not set")
         return "unknown"
 
-    request = build_scene_request(video_path, fps=fps, nframes=nframes, num_samples=num_samples)
+    request = build_scene_request(
+        video_path,
+        fps=fps,
+        nframes=nframes,
+        num_samples=num_samples,
+        frame_provider=frame_provider,
+    )
     if request is None:
         return "unknown"
 
@@ -255,12 +277,14 @@ def classify_video_scene(
     fps: float | None = None,
     nframes: int | None = None,
     num_samples: int = SCENE_FRAMES,
+    frame_provider=None,
 ) -> str:
     submission = submit_scene_classification(
         video_path,
         fps=fps,
         nframes=nframes,
         num_samples=num_samples,
+        frame_provider=frame_provider,
     )
     if not submission:
         return "unknown"

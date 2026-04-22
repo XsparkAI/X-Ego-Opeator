@@ -166,9 +166,16 @@ class Pipeline:
         hand_cfg = op_configs.get("hand_analysis", {})
 
         config_kwargs.setdefault("include_caption", seg_cfg.get("enabled", True))
+        config_kwargs.setdefault("caption_method", seg_cfg.get("method", "segment_v2t"))
         config_kwargs.setdefault("caption_window_sec", seg_cfg.get("window_sec", 10.0))
         config_kwargs.setdefault("caption_step_sec", seg_cfg.get("step_sec", 5.0))
         config_kwargs.setdefault("caption_frames_per_window", seg_cfg.get("frames_per_window", 12))
+        config_kwargs.setdefault("caption_task_window_sec", seg_cfg.get("task_window_sec", 12.0))
+        config_kwargs.setdefault("caption_task_step_sec", seg_cfg.get("task_step_sec", 6.0))
+        config_kwargs.setdefault("caption_task_frames_per_window", seg_cfg.get("task_frames_per_window", 12))
+        config_kwargs.setdefault("caption_action_window_sec", seg_cfg.get("action_window_sec", 6.0))
+        config_kwargs.setdefault("caption_action_step_sec", seg_cfg.get("action_step_sec", 3.0))
+        config_kwargs.setdefault("caption_action_frames_per_window", seg_cfg.get("action_frames_per_window", 8))
         config_kwargs.setdefault(
             "include_hand_vlm",
             hand_cfg.get("enabled", True)
