@@ -78,6 +78,10 @@ def _concat_blurred_to_root(episode_root: Path) -> None:
 class PrivacyBlurConfig:
     detector_backend: str = "egoblur"
     blur_targets: str = "both"  # "face" | "lp" | "both"
+    detection_mode: str = "sampling_expand"  # "sampling_expand" | "legacy_per_frame"
+    frame_sampling_step: int = 1
+    use_frame_cache: bool = False
+    frame_cache_num_workers: int = 1
     face: bool = True
     lp: bool = True
     scale: float = 1.0
@@ -87,9 +91,6 @@ class PrivacyBlurConfig:
     yolo_lp_model_path: str | None = None
     yolo_conf_thresh: float = 0.25
     yolo_input_size: int | None = 960
-    yolo_official_model_path: str = "weights/yolo26n.pt"
-    yolo_official_classes: list[int] | None = None
-    yolo_official_blur_ratio: float = 0.5
     max_concurrency: int = 1
 
 
@@ -109,7 +110,6 @@ class PrivacyBlurOperator:
             from .blur_privacy import (
                 _build_detectors,
                 _build_yolo_detectors,
-                _build_yolo_official_blurrer,
                 _get_device,
                 _resolve_blur_flags,
             )
@@ -120,6 +120,10 @@ class PrivacyBlurOperator:
                 lp=self.config.lp,
             )
             backend = self.config.detector_backend.lower()
+            if backend == "yolo" and self.config.use_frame_cache:
+                # frame_cache mode loads thread-local YOLO models inside blur_video.
+                self._detectors = None
+                return
             if backend == "egoblur":
                 device = _get_device()
                 self._detectors = _build_detectors(
@@ -136,16 +140,9 @@ class PrivacyBlurOperator:
                     face_model_path=self.config.yolo_face_model_path,
                     lp_model_path=self.config.yolo_lp_model_path,
                 )
-            elif backend == "yolo_official":
-                self._detectors = _build_yolo_official_blurrer(
-                    model_path=self.config.yolo_official_model_path,
-                    classes=self.config.yolo_official_classes,
-                    blur_ratio=self.config.yolo_official_blur_ratio,
-                    conf_thresh=self.config.yolo_conf_thresh,
-                )
             else:
                 raise ValueError(
-                    "privacy_blur.detector_backend must be 'egoblur', 'yolo', or 'yolo_official', "
+                    "privacy_blur.detector_backend must be 'egoblur' or 'yolo', "
                     f"got {self.config.detector_backend!r}"
                 )
             log.info("Privacy blur detectors loaded (will reuse across episodes)")
@@ -170,6 +167,10 @@ class PrivacyBlurOperator:
                     video_path, output_path,
                     detector_backend=self.config.detector_backend,
                     blur_targets=self.config.blur_targets,
+                    detection_mode=self.config.detection_mode,
+                    frame_sampling_step=self.config.frame_sampling_step,
+                    use_frame_cache=self.config.use_frame_cache,
+                    frame_cache_num_workers=self.config.frame_cache_num_workers,
                     face=self.config.face, lp=self.config.lp,
                     scale=self.config.scale,
                     face_thresh=self.config.face_thresh,
@@ -178,9 +179,6 @@ class PrivacyBlurOperator:
                     yolo_lp_model_path=self.config.yolo_lp_model_path,
                     yolo_conf_thresh=self.config.yolo_conf_thresh,
                     yolo_input_size=self.config.yolo_input_size,
-                    yolo_official_model_path=self.config.yolo_official_model_path,
-                    yolo_official_classes=self.config.yolo_official_classes,
-                    yolo_official_blur_ratio=self.config.yolo_official_blur_ratio,
                     detectors=self._detectors,
                 )
 

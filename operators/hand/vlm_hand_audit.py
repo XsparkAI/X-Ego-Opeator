@@ -16,7 +16,6 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
-import os
 import re
 import tempfile
 import time
@@ -26,14 +25,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 from ..vlm_limit import vlm_api_slot
-from ..caption.vlm_api import build_multimodal_message, submit_batch_chat_requests
+from ..caption.vlm_api import (
+    build_multimodal_message,
+    get_api_key,
+    get_default_model,
+    submit_batch_chat_requests,
+    submit_direct_chat_requests,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 logging.getLogger("dashscope").setLevel(logging.CRITICAL)
 
 # ── VLM Config ──────────────────────────────────────────────────────────────
-MODEL = "qwen3.5-flash"
+MODEL = get_default_model("hand", fallback="qwen3.5-flash")
 EXTRA_BODY = {"enable_thinking": False}
 
 # ── Sampling ────────────────────────────────────────────────────────────────
@@ -270,47 +275,6 @@ def _build_frame_requests(frame_paths: list[str], frame_ids: list[int]) -> list[
     return requests
 
 
-def _create_direct_client():
-    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("DASHSCOPE_API_KEY is not set")
-
-    from openai import OpenAI
-
-    base_url = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-
-def _extract_response_text(response) -> str | None:
-    choices = getattr(response, "choices", None) or []
-    if not choices:
-        return None
-    message = getattr(choices[0], "message", None)
-    content = getattr(message, "content", None)
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        texts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                texts.append(item.get("text", ""))
-        if texts:
-            return "\n".join(texts)
-    return str(content) if content is not None else None
-
-
-def _extract_usage_dict(response) -> dict:
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return {}
-    if isinstance(usage, dict):
-        return usage
-    return {
-        "prompt_tokens": getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0,
-        "completion_tokens": getattr(usage, "completion_tokens", 0) or getattr(usage, "output_tokens", 0) or 0,
-    }
-
-
 def _run_requests(requests: list[dict], fps: float) -> list[dict]:
     started_at = time.time()
     with vlm_api_slot():
@@ -356,7 +320,6 @@ def _run_requests_direct(requests: list[dict], fps: float, max_workers: int) -> 
     if not requests:
         return []
 
-    client = _create_direct_client()
     max_workers = max(1, max_workers)
     results = [None] * len(requests)
 
@@ -367,18 +330,19 @@ def _run_requests_direct(requests: list[dict], fps: float, max_workers: int) -> 
             started_at = time.time()
             try:
                 with vlm_api_slot():
-                    response = client.chat.completions.create(
-                        model=request.get("model", MODEL),
-                        messages=request["messages"],
-                        extra_body=request.get("extra_body") or EXTRA_BODY,
+                    response = submit_direct_chat_requests(
+                        [request],
+                        model=MODEL,
+                        extra_body=EXTRA_BODY,
+                        max_workers=1,
                     )
-
-                usage = _extract_usage_dict(response)
+                payload = response.get(request["custom_id"], {})
+                usage = payload.get("usage") or {}
                 _add_token_stats(
                     usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0),
                     usage.get("completion_tokens", 0) or usage.get("output_tokens", 0),
                 )
-                raw = _extract_response_text(response)
+                raw = payload.get("text")
                 count = parse_hand_count(raw or "")
                 active_manipulation = parse_active_manipulation(raw or "")
                 single_person_operation = parse_single_person_operation(raw or "")
@@ -612,8 +576,8 @@ def main():
     parser.add_argument("--output", type=Path, default=None, help="Output JSON path")
     args = parser.parse_args()
 
-    if not os.getenv("DASHSCOPE_API_KEY", "").strip():
-        raise SystemExit("DASHSCOPE_API_KEY is not set")
+    if not get_api_key():
+        raise SystemExit("VLM API key is not set")
 
     if args.max_workers != DEFAULT_MAX_WORKERS and not args.no_batch:
         log.info("max-workers is ignored in batch mode")

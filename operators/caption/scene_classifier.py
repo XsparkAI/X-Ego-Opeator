@@ -21,7 +21,12 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-MODEL = "qwen3.5-plus"
+try:
+    from .vlm_api import get_api_key, get_default_model
+except ImportError:
+    from vlm_api import get_api_key, get_default_model
+
+MODEL = get_default_model("scene", fallback="qwen3.5-plus")
 EXTRA_BODY = {"enable_thinking": False}
 TARGET_W = 640
 TARGET_H = 480
@@ -171,9 +176,8 @@ def submit_scene_classification(
     nframes: int | None = None,
     num_samples: int = SCENE_FRAMES,
 ) -> dict[str, object] | None:
-    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    if not api_key:
-        log.warning("Scene classification skipped: DASHSCOPE_API_KEY is not set")
+    if not get_api_key():
+        log.warning("Scene classification skipped: VLM API key is not set")
         return None
 
     request = build_scene_request(video_path, fps=fps, nframes=nframes, num_samples=num_samples)
@@ -199,9 +203,8 @@ def classify_video_scene_direct(
     nframes: int | None = None,
     num_samples: int = SCENE_FRAMES,
 ) -> str:
-    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    if not api_key:
-        log.warning("Scene classification skipped: DASHSCOPE_API_KEY is not set")
+    if not get_api_key():
+        log.warning("Scene classification skipped: VLM API key is not set")
         return "unknown"
 
     request = build_scene_request(video_path, fps=fps, nframes=nframes, num_samples=num_samples)

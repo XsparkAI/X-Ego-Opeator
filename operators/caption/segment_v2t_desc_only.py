@@ -22,7 +22,6 @@ Usage:
 import base64
 import json
 import logging
-import os
 import re
 import tempfile
 from collections import Counter
@@ -39,9 +38,9 @@ try:
 except ImportError:
     from video_path import episode_has_input_video, resolve_episode_video_path
 try:
-    from .vlm_api import build_multimodal_message, submit_batch_chat_requests
+    from .vlm_api import build_multimodal_message, get_default_model, submit_batch_chat_requests
 except ImportError:
-    from vlm_api import build_multimodal_message, submit_batch_chat_requests
+    from vlm_api import build_multimodal_message, get_default_model, submit_batch_chat_requests
 try:
     from .scene_classifier import classify_video_scene
 except ImportError:
@@ -66,8 +65,7 @@ TASK_SOP_MAP = {
 }
 
 # ── VLM Config ───────────────────────────────────────────────────────────────
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-MODEL = "qwen3.5-plus"
+MODEL = get_default_model("caption", fallback="qwen3.5-plus")
 THINKING_BUDGET = 256
 EXTRA_BODY = {"enable_thinking": True, "thinking_budget": THINKING_BUDGET}
 

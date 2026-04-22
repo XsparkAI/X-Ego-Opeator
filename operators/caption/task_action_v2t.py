@@ -22,7 +22,6 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import os
 import re
 import tempfile
 from collections import Counter
@@ -46,6 +45,7 @@ try:
     from .vlm_api import (
         build_multimodal_message,
         collect_batch_chat_requests,
+        get_default_model,
         submit_batch_chat_requests,
         submit_batch_chat_requests_async,
         submit_direct_chat_requests,
@@ -54,6 +54,7 @@ except ImportError:
     from vlm_api import (
         build_multimodal_message,
         collect_batch_chat_requests,
+        get_default_model,
         submit_batch_chat_requests,
         submit_batch_chat_requests_async,
         submit_direct_chat_requests,
@@ -77,8 +78,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 logging.getLogger("dashscope").setLevel(logging.CRITICAL)
 
-API_KEY = os.getenv("DASHSCOPE_API_KEY", "")
-MODEL = "qwen3.5-plus"
+MODEL = get_default_model("caption", fallback="qwen3.5-plus")
 THINKING_BUDGET = 384
 EXTRA_BODY = {"enable_thinking": True, "thinking_budget": THINKING_BUDGET}
 

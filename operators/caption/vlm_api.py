@@ -9,27 +9,70 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import httpx
+
 log = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
-BASE_URL = os.getenv("DASHSCOPE_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+DEFAULT_PROVIDER = "dashscope"
+DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_MODEL = "qwen3.5-plus"
 DEFAULT_POLL_INTERVAL_SEC = 20
 
 
+def get_vlm_provider() -> str:
+    provider = os.getenv("VLM_API_PROVIDER", DEFAULT_PROVIDER).strip().lower()
+    return provider or DEFAULT_PROVIDER
+
+
 def get_api_key() -> str:
-    return os.getenv("DASHSCOPE_API_KEY", "").strip()
+    provider = get_vlm_provider()
+    if provider == "volcengine_ark":
+        return os.getenv("ARK_API_KEY", "").strip() or os.getenv("VLM_API_KEY", "").strip()
+    return (
+        os.getenv("DASHSCOPE_API_KEY", "").strip()
+        or os.getenv("VLM_API_KEY", "").strip()
+    )
 
 
-def _create_client():
+def get_base_url() -> str:
+    provider = get_vlm_provider()
+    if provider == "volcengine_ark":
+        return (
+            os.getenv("ARK_BASE_URL", "").strip()
+            or os.getenv("VLM_BASE_URL", "").strip()
+            or DEFAULT_ARK_BASE_URL
+        )
+    return (
+        os.getenv("DASHSCOPE_BASE_URL", "").strip()
+        or os.getenv("VLM_BASE_URL", "").strip()
+        or DEFAULT_BASE_URL
+    )
+
+
+def get_default_model(task: str | None = None, fallback: str = DEFAULT_MODEL) -> str:
+    task_key = f"VLM_{str(task or '').strip().upper()}_MODEL"
+    return (
+        os.getenv(task_key, "").strip()
+        or os.getenv("VLM_DEFAULT_MODEL", "").strip()
+        or fallback
+    )
+
+
+def provider_supports_batch_api(provider: str | None = None) -> bool:
+    return (provider or get_vlm_provider()) == "dashscope"
+
+
+def _create_openai_compatible_client():
     api_key = get_api_key()
     if not api_key:
-        raise RuntimeError("DASHSCOPE_API_KEY is not set")
+        raise RuntimeError(f"{get_vlm_provider()} API key is not set")
 
     from openai import OpenAI
 
-    return OpenAI(api_key=api_key, base_url=BASE_URL)
+    return OpenAI(api_key=api_key, base_url=get_base_url())
 
 
 def build_multimodal_message(image_b64_list: list[str], prompt: str) -> list[dict[str, Any]]:
@@ -42,7 +85,7 @@ def build_multimodal_message(image_b64_list: list[str], prompt: str) -> list[dic
     return [{"role": "user", "content": content}]
 
 
-def _extract_response_text(response) -> str | None:
+def _extract_openai_response_text(response) -> str | None:
     choices = getattr(response, "choices", None) or []
     if not choices:
         return None
@@ -60,7 +103,7 @@ def _extract_response_text(response) -> str | None:
     return str(content) if content is not None else None
 
 
-def _extract_usage_dict(response) -> dict[str, Any]:
+def _extract_openai_usage_dict(response) -> dict[str, Any]:
     usage = getattr(response, "usage", None)
     if usage is None:
         return {}
@@ -69,6 +112,85 @@ def _extract_usage_dict(response) -> dict[str, Any]:
     return {
         "prompt_tokens": getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0,
         "completion_tokens": getattr(usage, "completion_tokens", 0) or getattr(usage, "output_tokens", 0) or 0,
+    }
+
+
+def _convert_messages_to_ark_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if isinstance(content, str):
+            items = [{"type": "input_text", "text": content}]
+        else:
+            items = []
+            for entry in content or []:
+                entry_type = entry.get("type")
+                if entry_type == "text":
+                    items.append({"type": "input_text", "text": entry.get("text", "")})
+                    continue
+                if entry_type == "image_url":
+                    image_value = entry.get("image_url")
+                    if isinstance(image_value, dict):
+                        image_value = image_value.get("url")
+                    if image_value:
+                        items.append({"type": "input_image", "image_url": image_value})
+        converted.append({"role": role, "content": items})
+    return converted
+
+
+def _extract_ark_response_text(payload: dict[str, Any]) -> str | None:
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    texts: list[str] = []
+    for item in payload.get("output", []) or []:
+        for content in item.get("content", []) or []:
+            if content.get("type") in {"output_text", "text"}:
+                text = content.get("text")
+                if text:
+                    texts.append(str(text))
+    if texts:
+        return "\n".join(texts)
+    return None
+
+
+def _extract_ark_usage_dict(payload: dict[str, Any]) -> dict[str, Any]:
+    usage = payload.get("usage") or {}
+    if not isinstance(usage, dict):
+        return {}
+    return {
+        "prompt_tokens": usage.get("input_tokens", 0) or usage.get("prompt_tokens", 0) or 0,
+        "completion_tokens": usage.get("output_tokens", 0) or usage.get("completion_tokens", 0) or 0,
+    }
+
+
+def _submit_one_ark_request(
+    client: httpx.Client,
+    req: dict[str, Any],
+    model: str,
+    extra_body: dict[str, Any] | None,
+) -> tuple[str, dict[str, Any]]:
+    payload: dict[str, Any] = {
+        "model": req.get("model", model),
+        "input": _convert_messages_to_ark_input(req["messages"]),
+    }
+    # Some OpenAI-compatible extras used by other providers are not accepted by
+    # Ark Responses API for multimodal requests. Keep the upper-layer contract
+    # stable by silently dropping them here.
+
+    response = client.post(
+        f"{get_base_url().rstrip('/')}/responses",
+        headers={"Authorization": f"Bearer {get_api_key()}"},
+        json=payload,
+    )
+    response.raise_for_status()
+    body = response.json()
+    return req["custom_id"], {
+        "text": _extract_ark_response_text(body),
+        "usage": _extract_ark_usage_dict(body),
+        "status_code": response.status_code,
     }
 
 
@@ -81,8 +203,13 @@ def submit_batch_chat_requests_async(
 ) -> dict[str, Any]:
     if not requests:
         raise ValueError("requests must not be empty")
+    if not provider_supports_batch_api():
+        raise NotImplementedError(
+            f"Provider {get_vlm_provider()!r} does not support async batch submission in this project; "
+            "please disable batch_enabled."
+        )
 
-    client = _create_client()
+    client = _create_openai_compatible_client()
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         jsonl_path = Path(tmp_dir) / "batch_requests.jsonl"
@@ -121,7 +248,12 @@ def submit_batch_chat_requests_async(
 
 
 def retrieve_batch_status(batch_id: str) -> dict[str, Any]:
-    client = _create_client()
+    if not provider_supports_batch_api():
+        raise NotImplementedError(
+            f"Provider {get_vlm_provider()!r} does not support batch status retrieval in this project."
+        )
+
+    client = _create_openai_compatible_client()
     batch = client.batches.retrieve(batch_id)
     result = {
         "batch_id": batch.id,
@@ -145,7 +277,12 @@ def collect_batch_chat_requests(
     poll_interval_sec: int = DEFAULT_POLL_INTERVAL_SEC,
     wait: bool = True,
 ) -> dict[str, Any]:
-    client = _create_client()
+    if not provider_supports_batch_api():
+        raise NotImplementedError(
+            f"Provider {get_vlm_provider()!r} does not support batch collection in this project."
+        )
+
+    client = _create_openai_compatible_client()
     batch = client.batches.retrieve(batch_id)
     terminal = {"completed", "failed", "expired", "cancelled"}
     counts = ""
@@ -219,6 +356,13 @@ def submit_batch_chat_requests(
 ) -> dict[str, dict[str, Any]]:
     if not requests:
         return {}
+    if not provider_supports_batch_api():
+        return submit_direct_chat_requests(
+            requests,
+            model=model,
+            extra_body=extra_body,
+            max_workers=min(8, len(requests)),
+        )
     submission = submit_batch_chat_requests_async(
         requests,
         model=model,
@@ -245,37 +389,55 @@ def submit_direct_chat_requests(
     if not requests:
         return {}
 
-    client = _create_client()
+    provider = get_vlm_provider()
     max_workers = max(1, max_workers)
     results: dict[str, dict[str, Any]] = {}
 
-    def _submit_one(req: dict[str, Any]) -> tuple[str, dict[str, Any]]:
-        response = client.chat.completions.create(
-            model=req.get("model", model),
-            messages=req["messages"],
-            extra_body=req.get("extra_body") or extra_body or {},
-        )
-        return req["custom_id"], {
-            "text": _extract_response_text(response),
-            "usage": _extract_usage_dict(response),
-            "status_code": 200,
-        }
+    if provider == "dashscope":
+        client = _create_openai_compatible_client()
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(_submit_one, req): req["custom_id"]
-            for req in requests
+        def _submit_one(req: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            response = client.chat.completions.create(
+                model=req.get("model", model),
+                messages=req["messages"],
+                extra_body=req.get("extra_body") or extra_body or {},
+            )
+            return req["custom_id"], {
+                "text": _extract_openai_response_text(response),
+                "usage": _extract_openai_usage_dict(response),
+                "status_code": 200,
+            }
+    elif provider == "volcengine_ark":
+        headers = {
+            "Authorization": f"Bearer {get_api_key()}",
+            "Content-Type": "application/json",
         }
-        for future in as_completed(future_map):
-            cid = future_map[future]
-            try:
-                key, value = future.result()
-                results[key] = value
-            except Exception as e:
-                results[cid] = {
-                    "text": None,
-                    "usage": None,
-                    "status_code": 500,
-                    "error": str(e),
-                }
+        client = httpx.Client(timeout=120.0, headers=headers)
+
+        def _submit_one(req: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+            return _submit_one_ark_request(client, req, model, extra_body)
+    else:
+        raise ValueError(f"Unsupported VLM provider: {provider!r}")
+
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_submit_one, req): req["custom_id"]
+                for req in requests
+            }
+            for future in as_completed(future_map):
+                cid = future_map[future]
+                try:
+                    key, value = future.result()
+                    results[key] = value
+                except Exception as e:
+                    results[cid] = {
+                        "text": None,
+                        "usage": None,
+                        "status_code": 500,
+                        "error": str(e),
+                    }
+    finally:
+        if hasattr(client, "close"):
+            client.close()
     return results

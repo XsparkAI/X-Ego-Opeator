@@ -13,10 +13,12 @@ Usage:
 """
 
 import argparse
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import logging
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -50,6 +52,7 @@ log = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 FACE_MODEL = PROJECT_ROOT / "weights" / "ego_blur_face_gen2.jit"
 LP_MODEL = PROJECT_ROOT / "weights" / "ego_blur_lp_gen2.jit"
+_FRAMECACHE_THREAD_STATE = threading.local()
 
 
 def _resolve_blur_flags(
@@ -175,47 +178,58 @@ def _build_yolo_detectors(
     return detectors
 
 
-def _build_yolo_official_blurrer(
+def _detect_cached_frame_yolo(
+    cached_path: str,
     *,
-    model_path: str | Path,
-    classes: list[int] | None = None,
-    blur_ratio: float = 0.5,
-    conf_thresh: float = 0.25,
-):
-    """Initialise Ultralytics official ObjectBlurrer."""
-    from ultralytics import solutions
-    import ultralytics.solutions.solutions as ul_solutions_mod
+    face_model_path: str | Path | None,
+    lp_model_path: str | Path | None,
+    conf_thresh: float,
+    input_size: int | None,
+    scale_x: float,
+    scale_y: float,
+) -> list[list[float]]:
+    """Run YOLO detection on one cached frame using thread-local model instances."""
+    state = _FRAMECACHE_THREAD_STATE
+    face_key = str(face_model_path) if face_model_path else None
+    lp_key = str(lp_model_path) if lp_model_path else None
 
-    weights = Path(model_path)
-    if not weights.is_absolute():
-        repo_candidate = PROJECT_ROOT.parent.parent / weights
-        if repo_candidate.exists():
-            weights = repo_candidate
-    if not weights.exists():
-        raise FileNotFoundError(f"YOLO official weights not found: {weights}")
+    if getattr(state, "face_model_key", None) != face_key:
+        state.face_model = _build_yolo_detector(face_model_path) if face_model_path else None
+        state.face_model_key = face_key
+    if getattr(state, "lp_model_key", None) != lp_key:
+        state.lp_model = _build_yolo_detector(lp_model_path) if lp_model_path else None
+        state.lp_model_key = lp_key
 
-    # BaseSolution runs check_imshow() during init, which can hard-crash in headless environments.
-    ul_solutions_mod.check_imshow = lambda warn=False: False
+    det_frame = cv2.imread(cached_path)
+    if det_frame is None:
+        raise RuntimeError(f"Failed to read cached frame: {cached_path}")
 
-    blurrer = solutions.ObjectBlurrer(
-        model=str(weights),
-        classes=classes,
-        blur_ratio=blur_ratio,
-        conf=conf_thresh,
-        show=False,
-        show_in=False,
-        show_out=False,
-        verbose=False,
-        show_labels=False,
-        show_conf=False,
-    )
-    log.info(
-        "YOLO official ObjectBlurrer loaded from %s (classes=%s, blur_ratio=%.2f)",
-        weights,
-        classes,
-        blur_ratio,
-    )
-    return blurrer
+    boxes: list[list[float]] = []
+    if getattr(state, "face_model", None) is not None:
+        boxes.extend(
+            _detect_frame_yolo(
+                det_frame,
+                state.face_model,
+                conf_thresh=conf_thresh,
+                class_ids=None,
+                input_size=input_size,
+            )
+        )
+    if getattr(state, "lp_model", None) is not None:
+        boxes.extend(
+            _detect_frame_yolo(
+                det_frame,
+                state.lp_model,
+                conf_thresh=conf_thresh,
+                class_ids=None,
+                input_size=input_size,
+            )
+        )
+    boxes = _dedupe_boxes(boxes)
+    return [
+        [b[0] * scale_x, b[1] * scale_y, b[2] * scale_x, b[3] * scale_y]
+        for b in boxes
+    ]
 
 
 # ── blur helpers ─────────────────────────────────────────────────────
@@ -331,6 +345,100 @@ def _dedupe_boxes(boxes: list[list[float]], iou_thresh: float = 0.9) -> list[lis
         if all(_iou(box, existing) < iou_thresh for existing in kept):
             kept.append(box)
     return kept
+
+
+def _detect_backend_boxes(
+    det_frame: np.ndarray,
+    *,
+    backend: str,
+    device: str,
+    face_det: EgoblurDetector | None,
+    lp_det: EgoblurDetector | None,
+    yolo_detectors: dict[str, Any] | None,
+    face_enabled: bool,
+    lp_enabled: bool,
+    yolo_conf_thresh: float,
+    yolo_input_size: int | None,
+) -> list[list[float]]:
+    """Run the configured backend on one detection frame and return merged boxes."""
+    if backend == "egoblur":
+        return _detect_frame(det_frame, face_det, lp_det, device)
+
+    if backend == "yolo":
+        boxes = []
+        if face_enabled and yolo_detectors and yolo_detectors["face_model"] is not None:
+            boxes.extend(
+                _detect_frame_yolo(
+                    det_frame,
+                    yolo_detectors["face_model"],
+                    conf_thresh=yolo_conf_thresh,
+                    class_ids=None,
+                    input_size=yolo_input_size,
+                )
+            )
+        if lp_enabled and yolo_detectors and yolo_detectors["lp_model"] is not None:
+            boxes.extend(
+                _detect_frame_yolo(
+                    det_frame,
+                    yolo_detectors["lp_model"],
+                    conf_thresh=yolo_conf_thresh,
+                    class_ids=None,
+                    input_size=yolo_input_size,
+                )
+            )
+        return _dedupe_boxes(boxes)
+
+
+def _read_frame_at(cap: cv2.VideoCapture, frame_idx: int) -> np.ndarray | None:
+    """Seek to a frame index and read it back."""
+    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+    ret, frame = cap.read()
+    if not ret:
+        return None
+    return frame
+
+
+def _merge_positive_range(
+    ranges: list[tuple[int, int]],
+    start: int,
+    end: int,
+) -> None:
+    """Merge a newly confirmed positive frame range into sorted intervals."""
+    if start > end:
+        return
+
+    merged: list[tuple[int, int]] = []
+    placed = False
+    cur_start, cur_end = start, end
+    for existing_start, existing_end in ranges:
+        if existing_end + 1 < cur_start:
+            merged.append((existing_start, existing_end))
+            continue
+        if cur_end + 1 < existing_start:
+            if not placed:
+                merged.append((cur_start, cur_end))
+                placed = True
+            merged.append((existing_start, existing_end))
+            continue
+
+        cur_start = min(cur_start, existing_start)
+        cur_end = max(cur_end, existing_end)
+
+    if not placed:
+        merged.append((cur_start, cur_end))
+
+    ranges[:] = merged
+
+
+def _find_positive_range(
+    ranges: list[tuple[int, int]],
+    frame_idx: int,
+) -> tuple[int, int] | None:
+    """Return the confirmed positive interval containing frame_idx, if any."""
+    for start, end in ranges:
+        if start <= frame_idx <= end:
+            return (start, end)
+    return None
 
 
 # ── video probe ─────────────────────────────────────────────────────
@@ -468,6 +576,10 @@ def blur_video(
     output_path: Path,
     detector_backend: str = "egoblur",
     blur_targets: str = "both",
+    detection_mode: str = "sampling_expand",
+    frame_sampling_step: int = 1,
+    use_frame_cache: bool = False,
+    frame_cache_num_workers: int = 1,
     face: bool = True,
     lp: bool = True,
     scale: float = 1.0,
@@ -477,9 +589,6 @@ def blur_video(
     yolo_lp_model_path: str | Path | None = None,
     yolo_conf_thresh: float = 0.25,
     yolo_input_size: int | None = 960,
-    yolo_official_model_path: str | Path = "weights/yolo26n.pt",
-    yolo_official_classes: list[int] | None = None,
-    yolo_official_blur_ratio: float = 0.5,
     resize: int | None = None,
     detectors: Any = None,
 ) -> dict:
@@ -498,6 +607,12 @@ def blur_video(
     Returns a summary dict with detection stats.
     """
     backend = str(detector_backend).lower()
+    detection_mode = str(detection_mode).strip().lower()
+    if detection_mode not in {"sampling_expand", "legacy_per_frame"}:
+        raise ValueError(
+            "privacy_blur.detection_mode must be 'sampling_expand' or 'legacy_per_frame', "
+            f"got {detection_mode!r}"
+        )
     face_enabled, lp_enabled = _resolve_blur_flags(
         blur_targets,
         face=face,
@@ -506,7 +621,19 @@ def blur_video(
     device = _get_device()
     face_det = lp_det = None
     yolo_detectors = None
-    official_blurrer = None
+    total_started = time.time()
+    cache_prepare_sec = 0.0
+    ffmpeg_prepare_sec = 0.0
+    detect_scan_sec = 0.0
+    write_pass_sec = 0.0
+    writer_close_wait_sec = 0.0
+    detect_imread_sec = 0.0
+    detect_infer_sec = 0.0
+    detect_post_sec = 0.0
+    main_video_read_sec = 0.0
+    blur_apply_sec = 0.0
+    writer_write_sec = 0.0
+    detect_cache_hits = 0
 
     if backend == "egoblur":
         if detectors is not None:
@@ -529,19 +656,9 @@ def blur_video(
                 face_model_path=yolo_face_model_path,
                 lp_model_path=yolo_lp_model_path,
             )
-    elif backend == "yolo_official":
-        if detectors is not None:
-            official_blurrer = detectors
-        else:
-            official_blurrer = _build_yolo_official_blurrer(
-                model_path=yolo_official_model_path,
-                classes=yolo_official_classes,
-                blur_ratio=yolo_official_blur_ratio,
-                conf_thresh=yolo_conf_thresh,
-            )
     else:
         raise ValueError(
-            f"Unsupported detector_backend={detector_backend!r}, expected 'egoblur', 'yolo', or 'yolo_official'"
+            f"Unsupported detector_backend={detector_backend!r}, expected 'egoblur' or 'yolo'"
         )
 
     cap = cv2.VideoCapture(str(video_path))
@@ -552,6 +669,14 @@ def blur_video(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    sampling_step = max(1, int(frame_sampling_step))
+
+    cache_profile = None
+    cached_paths: list[str] | None = None
+    frame_cache_enabled = False
+    frame_cache_executor: ThreadPoolExecutor | None = None
+    pending_detects: dict[int, Future] = {}
+    frame_cache_worker_count = max(1, int(frame_cache_num_workers))
 
     if backend == "egoblur":
         # Compute EgoBlur's exact target resolution and resize externally.
@@ -572,18 +697,53 @@ def blur_video(
         needs_resize = False
         scale_back_h = scale_back_w = 1.0
 
+    if backend == "yolo" and use_frame_cache:
+        cache_prepare_started = time.time()
+        try:
+            from ..frame_cache.cache_utils import (
+                PROFILE_VLM,
+                TARGET_H,
+                TARGET_W,
+                ensure_cached_frame_paths,
+            )
+        except ImportError:
+            from frame_cache.cache_utils import (  # type: ignore
+                PROFILE_VLM,
+                TARGET_H,
+                TARGET_W,
+                ensure_cached_frame_paths,
+            )
+
+        try:
+            cached_paths = ensure_cached_frame_paths(video_path.parent, list(range(total_frames)), profile=PROFILE_VLM)
+        except Exception as e:
+            log.warning(f"frame_cache unavailable for privacy_blur ({e}), falling back to video decoder")
+            cached_paths = None
+        if cached_paths is not None and len(cached_paths) == total_frames:
+            frame_cache_enabled = True
+            cache_profile = PROFILE_VLM
+            det_w, det_h = TARGET_W, TARGET_H
+            needs_resize = False
+            scale_back_w = frame_w / det_w
+            scale_back_h = frame_h / det_h
+            if device == "cpu" and frame_cache_worker_count > 1:
+                frame_cache_executor = ThreadPoolExecutor(max_workers=frame_cache_worker_count)
+        cache_prepare_sec = time.time() - cache_prepare_started
+
+    ffmpeg_prepare_started = time.time()
     src = _probe_video(str(video_path))
     ffmpeg_cmd = _build_ffmpeg_cmd(str(output_path), frame_w, frame_h, fps, src)
     log.info(f"Source encoding: {src['codec']}, pix_fmt={src['pix_fmt']}, bitrate={src['bitrate'] // 1000}kbps")
     stderr_tmp = tempfile.TemporaryFile()
     writer = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=stderr_tmp)
+    ffmpeg_prepare_sec = time.time() - ffmpeg_prepare_started
     detect_desc = (
         "exact EgoBlur target, internal resize bypassed"
         if backend == "egoblur"
         else (
-            f"YOLO imgsz={yolo_input_size or 'native'}"
-            if backend == "yolo"
-            else f"Ultralytics ObjectBlurrer blur_ratio={yolo_official_blur_ratio}"
+            f"frame_cache {det_w}x{det_h}, workers={frame_cache_worker_count}, YOLO imgsz={yolo_input_size or 'native'}"
+            if frame_cache_enabled
+            else f"YOLO imgsz={yolo_input_size or 'native'}"
         )
     )
 
@@ -598,85 +758,355 @@ def blur_video(
     frames_with_detections = 0
     t_start = time.time()
 
+    detection_cache: dict[int, list[list[float]]] = {}
+    positive_ranges: list[tuple[int, int]] = []
+    unique_detection_frames = 0
+
+    def submit_detect(frame_index: int) -> None:
+        if frame_cache_executor is None or cached_paths is None:
+            return
+        if frame_index < 0 or frame_index >= total_frames:
+            return
+        if frame_index in detection_cache or frame_index in pending_detects:
+            return
+        pending_detects[frame_index] = frame_cache_executor.submit(
+            _detect_cached_frame_yolo,
+            cached_paths[frame_index],
+            face_model_path=yolo_face_model_path if face_enabled else None,
+            lp_model_path=yolo_lp_model_path if lp_enabled else None,
+            conf_thresh=yolo_conf_thresh,
+            input_size=yolo_input_size,
+            scale_x=scale_back_w,
+            scale_y=scale_back_h,
+        )
+
+    def prefetch_detects(frame_indices: list[int]) -> None:
+        for candidate in frame_indices:
+            submit_detect(candidate)
+
+    def detect_boxes_for_frame_idx(frame_index: int, frame_bgr: np.ndarray | None = None) -> list[list[float]]:
+        nonlocal unique_detection_frames
+        nonlocal detect_imread_sec
+        nonlocal detect_infer_sec
+        nonlocal detect_post_sec
+        nonlocal detect_cache_hits
+        cached = detection_cache.get(frame_index)
+        if cached is not None:
+            detect_cache_hits += 1
+            return cached
+
+        if frame_cache_enabled and cached_paths is not None:
+            future = pending_detects.pop(frame_index, None)
+            if future is None:
+                if frame_cache_executor is not None:
+                    submit_detect(frame_index)
+                    future = pending_detects.pop(frame_index)
+                else:
+                    imread_started = time.time()
+                    det_frame = cv2.imread(cached_paths[frame_index])
+                    detect_imread_sec += time.time() - imread_started
+                    if det_frame is None:
+                        raise RuntimeError(f"Failed to read cached frame: {cached_paths[frame_index]}")
+                    infer_started = time.time()
+                    boxes = _detect_backend_boxes(
+                        det_frame,
+                        backend=backend,
+                        device=device,
+                        face_det=face_det,
+                        lp_det=lp_det,
+                        yolo_detectors=yolo_detectors,
+                        face_enabled=face_enabled,
+                        lp_enabled=lp_enabled,
+                        yolo_conf_thresh=yolo_conf_thresh,
+                        yolo_input_size=yolo_input_size,
+                    )
+                    detect_infer_sec += time.time() - infer_started
+                    post_started = time.time()
+                    boxes = [
+                        [b[0] * scale_back_w, b[1] * scale_back_h, b[2] * scale_back_w, b[3] * scale_back_h]
+                        for b in boxes
+                    ]
+                    detect_post_sec += time.time() - post_started
+                    unique_detection_frames += 1
+                    detection_cache[frame_index] = boxes
+                    return boxes
+            infer_started = time.time()
+            boxes = future.result()
+            detect_infer_sec += time.time() - infer_started
+            unique_detection_frames += 1
+            detection_cache[frame_index] = boxes
+            return boxes
+
+        local_frame = frame_bgr
+        if local_frame is None:
+            local_frame = _read_frame_at(cap_seek, frame_index)
+        if local_frame is None:
+            detection_cache[frame_index] = []
+            return detection_cache[frame_index]
+
+        if needs_resize:
+            post_started = time.time()
+            det_frame = cv2.resize(local_frame, (det_w, det_h))
+            detect_post_sec += time.time() - post_started
+        else:
+            det_frame = local_frame
+
+        infer_started = time.time()
+        boxes = _detect_backend_boxes(
+            det_frame,
+            backend=backend,
+            device=device,
+                    face_det=face_det,
+                    lp_det=lp_det,
+                    yolo_detectors=yolo_detectors,
+                    face_enabled=face_enabled,
+                    lp_enabled=lp_enabled,
+                    yolo_conf_thresh=yolo_conf_thresh,
+            yolo_input_size=yolo_input_size,
+        )
+        detect_infer_sec += time.time() - infer_started
+        unique_detection_frames += 1
+        if boxes and needs_resize:
+            post_started = time.time()
+            boxes = [
+                [b[0] * scale_back_w, b[1] * scale_back_h, b[2] * scale_back_w, b[3] * scale_back_h]
+                for b in boxes
+            ]
+            detect_post_sec += time.time() - post_started
+        detection_cache[frame_index] = boxes
+        return boxes
+
+    sample_hits = 0
+    unique_expanded_frames = 0
+    cap_detect = None
+    cap_seek = None
+    if detection_mode == "sampling_expand" and not frame_cache_enabled:
+        cap_detect = cv2.VideoCapture(str(video_path))
+        if not cap_detect.isOpened():
+            cap.release()
+            raise RuntimeError(f"Cannot open video for detection scan: {video_path}")
+        cap_seek = cv2.VideoCapture(str(video_path))
+        if not cap_seek.isOpened():
+            cap.release()
+            cap_detect.release()
+            raise RuntimeError(f"Cannot open video for random-access scan: {video_path}")
+
     with torch.no_grad(), patch_instances(fields=PATCH_INSTANCES_FIELDS):
-        while True:
-            ret, bgr = cap.read()
-            if not ret:
-                break
+        if detection_mode == "legacy_per_frame":
+            prefetch_width = max(4, frame_cache_worker_count * 2)
+            write_pass_started = time.time()
+            while True:
+                if frame_cache_enabled and frame_cache_executor is not None:
+                    prefetch_detects(list(range(frame_idx, min(total_frames, frame_idx + prefetch_width))))
+                read_started = time.time()
+                ret, bgr = cap.read()
+                main_video_read_sec += time.time() - read_started
+                if not ret:
+                    break
 
-            if needs_resize:
-                det_frame = cv2.resize(bgr, (det_w, det_h))
-            else:
-                det_frame = bgr
+                if frame_cache_enabled:
+                    boxes = detect_boxes_for_frame_idx(frame_idx)
+                elif needs_resize:
+                    det_frame = cv2.resize(bgr, (det_w, det_h))
+                    boxes = _detect_backend_boxes(
+                        det_frame,
+                        backend=backend,
+                        device=device,
+                        face_det=face_det,
+                        lp_det=lp_det,
+                        yolo_detectors=yolo_detectors,
+                        face_enabled=face_enabled,
+                        lp_enabled=lp_enabled,
+                        yolo_conf_thresh=yolo_conf_thresh,
+                        yolo_input_size=yolo_input_size,
+                    )
+                    unique_detection_frames += 1
+                    if boxes and needs_resize:
+                        boxes = [
+                            [b[0] * scale_back_w, b[1] * scale_back_h, b[2] * scale_back_w, b[3] * scale_back_h]
+                            for b in boxes
+                        ]
+                else:
+                    det_frame = bgr
+                    boxes = _detect_backend_boxes(
+                        det_frame,
+                        backend=backend,
+                        device=device,
+                        face_det=face_det,
+                        lp_det=lp_det,
+                        yolo_detectors=yolo_detectors,
+                        face_enabled=face_enabled,
+                        lp_enabled=lp_enabled,
+                        yolo_conf_thresh=yolo_conf_thresh,
+                        yolo_input_size=yolo_input_size,
+                    )
+                    unique_detection_frames += 1
 
-            if backend == "egoblur":
-                boxes = _detect_frame(det_frame, face_det, lp_det, device)
-            elif backend == "yolo":
-                boxes = []
-                if face_enabled and yolo_detectors["face_model"] is not None:
-                    boxes.extend(
-                        _detect_frame_yolo(
-                            det_frame,
-                            yolo_detectors["face_model"],
-                            conf_thresh=yolo_conf_thresh,
-                            class_ids=None,
-                            input_size=yolo_input_size,
-                        )
-                    )
-                if lp_enabled and yolo_detectors["lp_model"] is not None:
-                    boxes.extend(
-                        _detect_frame_yolo(
-                            det_frame,
-                            yolo_detectors["lp_model"],
-                            conf_thresh=yolo_conf_thresh,
-                            class_ids=None,
-                            input_size=yolo_input_size,
-                        )
-                    )
-                boxes = _dedupe_boxes(boxes)
-            else:
-                results = official_blurrer(det_frame)
-                bgr = results.plot_im
-                detected_count = int(getattr(results, "total_tracks", 0) or 0)
-                if detected_count > 0:
-                    total_detections += detected_count
+                if boxes:
+                    blur_started = time.time()
+                    bgr = _apply_blur(bgr, boxes, scale)
+                    blur_apply_sec += time.time() - blur_started
+                    total_detections += len(boxes)
                     frames_with_detections += 1
+                    detection_cache[frame_idx] = boxes
+
+                write_started = time.time()
                 writer.stdin.write(bgr.tobytes())
+                writer_write_sec += time.time() - write_started
                 frame_idx += 1
+
                 if frame_idx % 500 == 0:
                     elapsed = time.time() - t_start
                     log.info(
-                        f"  frame {frame_idx}/{total_frames} "
+                        f"  legacy frame {frame_idx}/{total_frames} "
                         f"({frame_idx / total_frames * 100:.0f}%), "
                         f"{frame_idx / elapsed:.1f} fps"
                     )
-                continue
+            write_pass_sec = time.time() - write_pass_started
+        else:
+            prefetch_width = max(4, frame_cache_worker_count * 2)
+            detect_scan_started = time.time()
+            if frame_cache_enabled:
+                sample_indices = list(range(0, total_frames, sampling_step))
+                for sample_pos, detect_scan_idx in enumerate(sample_indices):
+                    if frame_cache_executor is not None:
+                        prefetch_detects(sample_indices[sample_pos: sample_pos + prefetch_width])
+                    sample_boxes = detect_boxes_for_frame_idx(detect_scan_idx)
+                    if sample_boxes:
+                        sample_hits += 1
+                        if _find_positive_range(positive_ranges, detect_scan_idx) is None:
+                            range_start = detect_scan_idx
+                            range_end = detect_scan_idx
 
-            if boxes:
-                if needs_resize:
-                    boxes = [
-                        [b[0] * scale_back_w, b[1] * scale_back_h,
-                         b[2] * scale_back_w, b[3] * scale_back_h]
-                        for b in boxes
-                    ]
-                bgr = _apply_blur(bgr, boxes, scale)
-                total_detections += len(boxes)
-                frames_with_detections += 1
+                            back_idx = detect_scan_idx - 1
+                            while back_idx >= 0:
+                                if frame_cache_executor is not None:
+                                    prefetch_detects(list(range(max(0, back_idx - prefetch_width + 1), back_idx + 1)))
+                                was_unknown = back_idx not in detection_cache
+                                back_boxes = detect_boxes_for_frame_idx(back_idx)
+                                if not back_boxes:
+                                    break
+                                if was_unknown:
+                                    unique_expanded_frames += 1
+                                range_start = back_idx
+                                back_idx -= 1
 
-            writer.stdin.write(bgr.tobytes())
-            frame_idx += 1
+                            forward_idx = detect_scan_idx + 1
+                            while forward_idx < total_frames:
+                                if frame_cache_executor is not None:
+                                    prefetch_detects(list(range(forward_idx, min(total_frames, forward_idx + prefetch_width))))
+                                was_unknown = forward_idx not in detection_cache
+                                forward_boxes = detect_boxes_for_frame_idx(forward_idx)
+                                if not forward_boxes:
+                                    break
+                                if was_unknown:
+                                    unique_expanded_frames += 1
+                                range_end = forward_idx
+                                forward_idx += 1
 
-            if frame_idx % 500 == 0:
-                elapsed = time.time() - t_start
-                log.info(
-                    f"  frame {frame_idx}/{total_frames} "
-                    f"({frame_idx / total_frames * 100:.0f}%), "
-                    f"{frame_idx / elapsed:.1f} fps"
-                )
+                            _merge_positive_range(positive_ranges, range_start, range_end)
+                    if (sample_pos + 1) % 500 == 0:
+                        elapsed = time.time() - t_start
+                        log.info(
+                            f"  detect scan {sample_pos + 1}/{len(sample_indices)} sampled "
+                            f"({(sample_pos + 1) / max(1, len(sample_indices)) * 100:.0f}%), "
+                            f"{unique_detection_frames / elapsed:.1f} detect fps"
+                        )
+                detect_scan_sec = time.time() - detect_scan_started
+            else:
+                detect_scan_idx = 0
+                while True:
+                    ret, sample_bgr = cap_detect.read()
+                    if not ret:
+                        break
+
+                    if detect_scan_idx % sampling_step == 0:
+                        sample_boxes = detect_boxes_for_frame_idx(detect_scan_idx, sample_bgr)
+                        if sample_boxes:
+                            sample_hits += 1
+                            if _find_positive_range(positive_ranges, detect_scan_idx) is None:
+                                range_start = detect_scan_idx
+                                range_end = detect_scan_idx
+
+                                back_idx = detect_scan_idx - 1
+                                while back_idx >= 0:
+                                    was_unknown = back_idx not in detection_cache
+                                    back_boxes = detect_boxes_for_frame_idx(back_idx)
+                                    if not back_boxes:
+                                        break
+                                    if was_unknown:
+                                        unique_expanded_frames += 1
+                                    range_start = back_idx
+                                    back_idx -= 1
+
+                                forward_idx = detect_scan_idx + 1
+                                while forward_idx < total_frames:
+                                    was_unknown = forward_idx not in detection_cache
+                                    forward_boxes = detect_boxes_for_frame_idx(forward_idx)
+                                    if not forward_boxes:
+                                        break
+                                    if was_unknown:
+                                        unique_expanded_frames += 1
+                                    range_end = forward_idx
+                                    forward_idx += 1
+
+                                _merge_positive_range(positive_ranges, range_start, range_end)
+
+                    detect_scan_idx += 1
+                    if detect_scan_idx % 500 == 0:
+                        elapsed = time.time() - t_start
+                        log.info(
+                            f"  detect scan {detect_scan_idx}/{total_frames} "
+                            f"({detect_scan_idx / total_frames * 100:.0f}%), "
+                            f"{detect_scan_idx / elapsed:.1f} fps"
+                        )
+                detect_scan_sec = time.time() - detect_scan_started
+
+                cap_detect.release()
+                cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+            write_pass_started = time.time()
+            while True:
+                read_started = time.time()
+                ret, bgr = cap.read()
+                main_video_read_sec += time.time() - read_started
+                if not ret:
+                    break
+
+                boxes = detection_cache.get(frame_idx, [])
+                if boxes:
+                    blur_started = time.time()
+                    bgr = _apply_blur(bgr, boxes, scale)
+                    blur_apply_sec += time.time() - blur_started
+                    total_detections += len(boxes)
+                    frames_with_detections += 1
+
+                write_started = time.time()
+                writer.stdin.write(bgr.tobytes())
+                writer_write_sec += time.time() - write_started
+                frame_idx += 1
+
+                if frame_idx % 500 == 0:
+                    elapsed = time.time() - t_start
+                    log.info(
+                        f"  write frame {frame_idx}/{total_frames} "
+                        f"({frame_idx / total_frames * 100:.0f}%), "
+                        f"{frame_idx / elapsed:.1f} fps"
+                    )
+            write_pass_sec = time.time() - write_pass_started
 
     cap.release()
+    if cap_detect is not None and cap_detect.isOpened():
+        cap_detect.release()
+    if cap_seek is not None and cap_seek.isOpened():
+        cap_seek.release()
+    pending_detects.clear()
+    if frame_cache_executor is not None:
+        frame_cache_executor.shutdown(wait=True, cancel_futures=True)
     writer.stdin.close()
+    writer_wait_started = time.time()
     writer.wait()
+    writer_close_wait_sec = time.time() - writer_wait_started
     stderr_tmp.seek(0)
     ffmpeg_stderr = stderr_tmp.read()
     stderr_tmp.close()
@@ -696,22 +1126,43 @@ def blur_video(
         "detections_total": total_detections,
         "frames_with_detections": frames_with_detections,
         "detector_backend": backend,
+        "detection_mode": detection_mode,
         "blur_targets": blur_targets,
+        "frame_sampling_step": sampling_step,
+        "sampled_frames": (total_frames + sampling_step - 1) // sampling_step if total_frames > 0 else 0,
+        "sample_hit_frames": sample_hits,
+        "unique_detection_frames": unique_detection_frames,
+        "unique_expanded_frames": unique_expanded_frames,
+        "positive_ranges": positive_ranges,
         "blur_face": face_enabled,
         "blur_lp": lp_enabled,
         "scale_factor": scale,
+        "decoder": "frame_cache" if frame_cache_enabled else "video_decoder",
+        "cache_profile": cache_profile,
+        "frame_cache_num_workers": frame_cache_worker_count if frame_cache_enabled else 0,
+        "timings": {
+            "total_wall_sec": round(time.time() - total_started, 2),
+            "cache_prepare_sec": round(cache_prepare_sec, 2),
+            "ffmpeg_prepare_sec": round(ffmpeg_prepare_sec, 2),
+            "detect_scan_sec": round(detect_scan_sec, 2),
+            "write_pass_sec": round(write_pass_sec, 2),
+            "writer_close_wait_sec": round(writer_close_wait_sec, 2),
+            "detect_imread_sec": round(detect_imread_sec, 2),
+            "detect_infer_sec": round(detect_infer_sec, 2),
+            "detect_post_sec": round(detect_post_sec, 2),
+            "main_video_read_sec": round(main_video_read_sec, 2),
+            "blur_apply_sec": round(blur_apply_sec, 2),
+            "writer_write_sec": round(writer_write_sec, 2),
+        },
+        "counters": {
+            "detect_cache_hits": detect_cache_hits,
+        },
     }
     if backend == "yolo":
         summary["yolo_face_model_path"] = str(yolo_face_model_path) if yolo_face_model_path else None
         summary["yolo_lp_model_path"] = str(yolo_lp_model_path) if yolo_lp_model_path else None
         summary["yolo_conf_thresh"] = yolo_conf_thresh
         summary["yolo_input_size"] = yolo_input_size
-    elif backend == "yolo_official":
-        summary["yolo_official_model_path"] = str(yolo_official_model_path)
-        summary["yolo_official_classes"] = yolo_official_classes
-        summary["yolo_official_blur_ratio"] = yolo_official_blur_ratio
-        summary["yolo_conf_thresh"] = yolo_conf_thresh
-
     log.info(
         f"Done: {frame_idx} frames in {elapsed:.1f}s "
         f"({summary['throughput_fps']:.1f} fps), saved to {output_path}"
@@ -778,9 +1229,6 @@ def main():
     parser.add_argument("--yolo-lp-model-path", type=str, default=None, help="Dedicated YOLO license-plate weights path")
     parser.add_argument("--yolo-conf-thresh", type=float, default=0.25, help="YOLO detection threshold")
     parser.add_argument("--yolo-input-size", type=int, default=960, help="YOLO imgsz")
-    parser.add_argument("--yolo-official-model-path", type=str, default="weights/yolo26n.pt", help="Official YOLO26 weights path for ObjectBlurrer")
-    parser.add_argument("--yolo-official-classes", type=int, nargs="*", default=None, help="Optional classes for ObjectBlurrer, e.g. --yolo-official-classes 0 2")
-    parser.add_argument("--yolo-official-blur-ratio", type=float, default=0.5, help="Ultralytics ObjectBlurrer blur_ratio")
     parser.add_argument("--preview", action="store_true", help="Generate side-by-side preview")
     args = parser.parse_args()
 
@@ -805,9 +1253,6 @@ def main():
         yolo_lp_model_path=args.yolo_lp_model_path,
         yolo_conf_thresh=args.yolo_conf_thresh,
         yolo_input_size=args.yolo_input_size,
-        yolo_official_model_path=args.yolo_official_model_path,
-        yolo_official_classes=args.yolo_official_classes,
-        yolo_official_blur_ratio=args.yolo_official_blur_ratio,
     )
 
     if args.preview:

@@ -104,6 +104,33 @@ class Pipeline:
         api_key = config.get("dashscope_api_key", "")
         if api_key and not os.environ.get("DASHSCOPE_API_KEY"):
             os.environ["DASHSCOPE_API_KEY"] = api_key
+        vlm_api_key = config.get("vlm_api_key", "")
+        if vlm_api_key and not os.environ.get("VLM_API_KEY"):
+            os.environ["VLM_API_KEY"] = vlm_api_key
+        ark_api_key = config.get("ark_api_key", "")
+        if ark_api_key and not os.environ.get("ARK_API_KEY"):
+            os.environ["ARK_API_KEY"] = ark_api_key
+        vlm_provider = str(config.get("vlm_api_provider", "")).strip()
+        if vlm_provider and not os.environ.get("VLM_API_PROVIDER"):
+            os.environ["VLM_API_PROVIDER"] = vlm_provider
+        vlm_base_url = str(config.get("vlm_base_url", "")).strip()
+        if vlm_base_url and not os.environ.get("VLM_BASE_URL"):
+            os.environ["VLM_BASE_URL"] = vlm_base_url
+        ark_base_url = str(config.get("ark_base_url", "")).strip()
+        if ark_base_url and not os.environ.get("ARK_BASE_URL"):
+            os.environ["ARK_BASE_URL"] = ark_base_url
+        vlm_default_model = str(config.get("vlm_default_model", "")).strip()
+        if vlm_default_model and not os.environ.get("VLM_DEFAULT_MODEL"):
+            os.environ["VLM_DEFAULT_MODEL"] = vlm_default_model
+        caption_model = str(config.get("vlm_caption_model", "")).strip()
+        if caption_model and not os.environ.get("VLM_CAPTION_MODEL"):
+            os.environ["VLM_CAPTION_MODEL"] = caption_model
+        hand_model = str(config.get("vlm_hand_model", "")).strip()
+        if hand_model and not os.environ.get("VLM_HAND_MODEL"):
+            os.environ["VLM_HAND_MODEL"] = hand_model
+        scene_model = str(config.get("vlm_scene_model", "")).strip()
+        if scene_model and not os.environ.get("VLM_SCENE_MODEL"):
+            os.environ["VLM_SCENE_MODEL"] = scene_model
         input_video_path = str(config.get("input_video_path", "rgb.mp4")).strip() or "rgb.mp4"
         os.environ["EGOX_INPUT_VIDEO_PATH"] = input_video_path
         set_cpu_global_limit(config.get("cpu_global_max_concurrency", 2))

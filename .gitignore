@@ -6,3 +6,5 @@ tmp/
 CLAUDE.md
 doc/
 .codex
+datasets/
+runs/
