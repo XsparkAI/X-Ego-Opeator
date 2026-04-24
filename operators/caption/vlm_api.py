@@ -20,6 +20,10 @@ DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_ARK_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 DEFAULT_MODEL = "qwen3.5-plus"
 DEFAULT_POLL_INTERVAL_SEC = 20
+PROVIDER_DEFAULT_MODELS = {
+    "dashscope": "qwen3.5-flash",
+    "volcengine_ark": "doubao-seed-2-0-lite-260215",
+}
 
 
 def get_vlm_provider() -> str:
@@ -44,12 +48,19 @@ def get_base_url() -> str:
     return DEFAULT_BASE_URL
 
 
-def get_default_model(task: str | None = None, fallback: str = DEFAULT_MODEL) -> str:
+def get_provider_default_model(provider: str | None = None, fallback: str = DEFAULT_MODEL) -> str:
+    resolved_provider = (provider or get_vlm_provider()).strip().lower()
+    return PROVIDER_DEFAULT_MODELS.get(resolved_provider, fallback)
+
+
+def get_default_model(task: str | None = None, fallback: str | None = None) -> str:
     task_key = f"VLM_{str(task or '').strip().upper()}_MODEL"
+    provider_default = get_provider_default_model(fallback=DEFAULT_MODEL if fallback is None else fallback)
     return (
         os.getenv(task_key, "").strip()
+        or os.getenv("VLM_MODEL", "").strip()
         or os.getenv("VLM_DEFAULT_MODEL", "").strip()
-        or fallback
+        or provider_default
     )
 
 

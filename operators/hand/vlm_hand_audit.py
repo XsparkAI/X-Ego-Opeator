@@ -16,30 +16,38 @@ import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
+import os
 import re
-import tempfile
 import time
 import threading
 from pathlib import Path
 
 import cv2
-import numpy as np
 from ..vlm_limit import vlm_api_slot
 from ..caption.vlm_api import (
     build_multimodal_message,
     get_api_key,
     get_default_model,
+    provider_supports_batch_api,
     submit_batch_chat_requests,
     submit_direct_chat_requests,
 )
+from ..frame_cache.frame_provider import FrameProvider
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 logging.getLogger("dashscope").setLevel(logging.CRITICAL)
 
 # ── VLM Config ──────────────────────────────────────────────────────────────
-MODEL = get_default_model("hand", fallback="qwen3.5-flash")
 EXTRA_BODY = {"enable_thinking": False}
+
+
+def _get_hand_model() -> str:
+    return (
+        os.getenv("VLM_MODEL", "").strip()
+        or os.getenv("VLM_HAND_MODEL", "").strip()
+        or get_default_model("hand")
+    )
 
 # ── Sampling ────────────────────────────────────────────────────────────────
 DEFAULT_FRAME_STEP = 30
@@ -67,7 +75,7 @@ def _add_token_stats(input_tokens: int, output_tokens: int):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Frame extraction (unchanged)
+# Frame extraction
 # ═════════════════════════════════════════════════════════════════════════════
 
 def sample_frames(video_path: str, frame_step: int) -> tuple[list[int], float, int]:
@@ -81,13 +89,18 @@ def sample_frames(video_path: str, frame_step: int) -> tuple[list[int], float, i
     return frame_ids, fps, total
 
 
-def extract_frames_to_dir(video_path: str, frame_ids: list[int], tmp_dir: str) -> list[str]:
+def extract_frames_b64(
+    video_path: str,
+    frame_ids: list[int],
+    *,
+    frame_provider: FrameProvider | None = None,
+) -> list[str]:
     try:
-        from ..frame_cache.cache_utils import ensure_cached_frame_paths
+        from ..frame_cache.cache_utils import ensure_cached_frame_b64
     except ImportError:
         import sys as _sys
         _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from frame_cache.cache_utils import ensure_cached_frame_paths
+        from frame_cache.cache_utils import ensure_cached_frame_b64
 
     try:
         from ..video_utils import get_manual_rotation, apply_rotation
@@ -96,25 +109,30 @@ def extract_frames_to_dir(video_path: str, frame_ids: list[int], tmp_dir: str) -
         _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from video_utils import get_manual_rotation, apply_rotation
 
-    cached = ensure_cached_frame_paths(Path(video_path).parent, frame_ids)
+    if frame_provider is not None:
+        cached = frame_provider.get_b64(frame_ids)
+        if cached:
+            return cached
+
+    cached = ensure_cached_frame_b64(Path(video_path).parent, frame_ids)
     if cached:
         return cached
 
     rotation = get_manual_rotation(video_path)
     cap = cv2.VideoCapture(video_path)
-    paths = []
-    for i, fid in enumerate(sorted(set(frame_ids))):
+    frames_b64: list[str] = []
+    for fid in sorted(set(frame_ids)):
         cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
         ret, frame = cap.read()
         if not ret:
             continue
         frame = apply_rotation(frame, rotation)
         frame = cv2.resize(frame, (TARGET_W, TARGET_H))
-        path = os.path.join(tmp_dir, f"frame_{i:03d}.jpg")
-        cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
-        paths.append(path)
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if ok:
+            frames_b64.append(base64.b64encode(buf).decode("ascii"))
     cap.release()
-    return paths
+    return frames_b64
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -257,16 +275,15 @@ def parse_single_person_operation(text: str) -> bool | None:
     return None
 
 
-def _build_frame_requests(frame_paths: list[str], frame_ids: list[int]) -> list[dict]:
+def _build_frame_requests(frames_b64: list[str], frame_ids: list[int]) -> list[dict]:
     requests = []
-    for idx, (image_path, frame_id) in enumerate(zip(frame_paths, frame_ids)):
-        image_bytes = Path(image_path).read_bytes()
+    for idx, (image_b64, frame_id) in enumerate(zip(frames_b64, frame_ids)):
         requests.append(
             {
                 "custom_id": f"frame_{idx}",
-                "model": MODEL,
+                "model": _get_hand_model(),
                 "messages": build_multimodal_message(
-                    [base64.b64encode(image_bytes).decode("ascii")],
+                    [image_b64],
                     SINGLE_FRAME_PROMPT,
                 ),
                 "_meta": {"frame_idx": idx, "global_frame": frame_id},
@@ -278,7 +295,7 @@ def _build_frame_requests(frame_paths: list[str], frame_ids: list[int]) -> list[
 def _run_requests(requests: list[dict], fps: float) -> list[dict]:
     started_at = time.time()
     with vlm_api_slot():
-        responses = submit_batch_chat_requests(requests, model=MODEL, extra_body=EXTRA_BODY)
+        responses = submit_batch_chat_requests(requests, model=_get_hand_model(), extra_body=EXTRA_BODY)
 
     elapsed = time.time() - started_at
     per_frame_elapsed = round(elapsed / max(len(requests), 1), 2)
@@ -332,7 +349,7 @@ def _run_requests_direct(requests: list[dict], fps: float, max_workers: int) -> 
                 with vlm_api_slot():
                     response = submit_direct_chat_requests(
                         [request],
-                        model=MODEL,
+                        model=_get_hand_model(),
                         extra_body=EXTRA_BODY,
                         max_workers=1,
                     )
@@ -410,8 +427,8 @@ def _run_requests_direct(requests: list[dict], fps: float, max_workers: int) -> 
     ]
 
 
-def _run_single_video_batch(frame_paths: list[str], frame_ids: list[int], fps: float) -> list[dict]:
-    requests = _build_frame_requests(frame_paths, frame_ids)
+def _run_single_video_batch(frames_b64: list[str], frame_ids: list[int], fps: float) -> list[dict]:
+    requests = _build_frame_requests(frames_b64, frame_ids)
     results = _run_requests(requests, fps)
 
     for retry_round in range(1, MAX_RETRY_ROUNDS + 1):
@@ -449,29 +466,38 @@ def _run_single_video_batch(frame_paths: list[str], frame_ids: list[int], fps: f
     ]
 
 
-def _run_single_video_direct(frame_paths: list[str], frame_ids: list[int], fps: float, max_workers: int) -> list[dict]:
-    requests = _build_frame_requests(frame_paths, frame_ids)
+def _run_single_video_direct(frames_b64: list[str], frame_ids: list[int], fps: float, max_workers: int) -> list[dict]:
+    requests = _build_frame_requests(frames_b64, frame_ids)
     return _run_requests_direct(requests, fps, max_workers=max_workers)
 
 
 def vlm_hand_audit_parallel(
     video_path: str,
-    frame_paths: list[str],
     frame_ids: list[int],
     fps: float,
     max_workers: int,
     batch_enabled: bool = DEFAULT_BATCH_ENABLED,
+    frame_provider: FrameProvider | None = None,
 ) -> list[dict]:
     """Audit sampled frames using either one batch job or direct per-frame requests."""
-    del video_path
-    if not frame_paths or not frame_ids:
+    if not frame_ids:
+        return []
+    frames_b64 = extract_frames_b64(
+        video_path,
+        frame_ids,
+        frame_provider=frame_provider,
+    )
+    if not frames_b64:
         return []
     try:
-        if batch_enabled:
-            return _run_single_video_batch(frame_paths, frame_ids, fps)
-        return _run_single_video_direct(frame_paths, frame_ids, fps, max_workers=max_workers)
+        effective_batch_enabled = batch_enabled and provider_supports_batch_api()
+        if batch_enabled and not effective_batch_enabled:
+            log.info("Batch mode requested but current VLM provider does not support batch API; falling back to direct requests")
+        if effective_batch_enabled:
+            return _run_single_video_batch(frames_b64, frame_ids, fps)
+        return _run_single_video_direct(frames_b64, frame_ids, fps, max_workers=max_workers)
     except Exception as e:
-        mode = "batch" if batch_enabled else "direct"
+        mode = "batch" if (batch_enabled and provider_supports_batch_api()) else "direct"
         log.error("  Hand %s mode failed: %s", mode, e)
         return []
 
@@ -494,23 +520,28 @@ def audit_video(
 
     frame_ids, fps, total_frames = sample_frames(str(video_path), frame_step)
     duration = total_frames / fps
+    frame_provider = FrameProvider(video_path.parent)
+    effective_batch_enabled = batch_enabled and provider_supports_batch_api()
 
     log.info(f"Video: {video_path.name}, {total_frames} frames @ {fps:.1f} fps, duration={duration:.1f}s")
-    mode_desc = "batch VLM audit (single batch job)" if batch_enabled else f"direct VLM audit (workers={max_workers})"
+    mode_desc = (
+        "batch VLM audit (single batch job)"
+        if effective_batch_enabled
+        else f"direct VLM audit (workers={max_workers})"
+    )
     log.info(f"Sampling {len(frame_ids)} frames for {mode_desc}")
 
     t_start = time.time()
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        frame_paths = extract_frames_to_dir(str(video_path), frame_ids, tmp_dir)
-        per_frame = vlm_hand_audit_parallel(
-            str(video_path),
-            frame_paths,
-            frame_ids,
-            fps,
-            max_workers,
-            batch_enabled=batch_enabled,
-        )
+    if frame_ids:
+        frame_provider.ensure_profile(frame_ids)
+    per_frame = vlm_hand_audit_parallel(
+        str(video_path),
+        frame_ids,
+        fps,
+        max_workers,
+        batch_enabled=batch_enabled,
+        frame_provider=frame_provider,
+    )
 
     elapsed = time.time() - t_start
 
@@ -528,8 +559,10 @@ def audit_video(
 
     summary = {
         "video": str(video_path),
-        "total_frames_sampled": len(per_frame),
+        "total_frames": total_frames,
+        "total_frames_sampled": len(frame_ids),
         "valid_responses": n,
+        "failed_responses": max(len(frame_ids) - n, 0),
         "retried_responses": sum(1 for r in per_frame if r.get("retried", 0) > 0),
         "fps": round(fps, 2),
         "duration_sec": round(duration, 2),
@@ -542,8 +575,9 @@ def audit_video(
         "single_person_operation_ratio": round(sum(1 for v in single_person_flags if v) / max(n, 1), 4),
         "parallel_config": {
             "batch_enabled": batch_enabled,
+            "effective_batch_enabled": effective_batch_enabled,
             "max_workers": max_workers,
-            "avg_time_per_frame_sec": round(elapsed / max(len(frame_paths), 1), 3)
+            "avg_time_per_frame_sec": round(elapsed / max(len(frame_ids), 1), 3)
         },
         "token_usage": dict(_token_stats),
     }
@@ -554,8 +588,8 @@ def audit_video(
     }
 
     log.info("=" * 60)
-    log.info(f"Audit complete: {len(frame_paths)} frames, {n} valid, {elapsed:.1f}s total")
-    log.info(f"  Throughput: {len(frame_paths)/elapsed:.2f} frames/sec")
+    log.info(f"Audit complete: {len(frame_ids)} frames, {n} valid, {elapsed:.1f}s total")
+    log.info(f"  Throughput: {len(frame_ids)/elapsed:.2f} frames/sec")
     log.info(f"  Avg ego hand count: {summary['avg_ego_hand_count']}")
     log.info(f"  Active manipulation ratio: {summary['active_manipulation_ratio']:.2%}")
     log.info(f"  Single-person operation ratio: {summary['single_person_operation_ratio']:.2%}")
@@ -589,7 +623,7 @@ def main():
         batch_enabled=not args.no_batch,
     )
 
-    out_path = args.output or args.video.with_name("vlm_hand_audit_parallel.json")
+    out_path = args.output or args.video.with_name("hand_analysis.json")
     with open(out_path, "w") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     log.info(f"Saved to {out_path}")

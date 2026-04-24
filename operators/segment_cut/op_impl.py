@@ -30,6 +30,7 @@ _MIN_FILE_BYTES = 1024  # skip re-cut if file already > 1 KB
 class SegmentCutConfig:
     min_duration_sec: float = 0.5
     granularity: str = "atomic_action"
+    ffmpeg_timeout_sec: float = 180.0
 
 
 class SegmentCutOperator:
@@ -98,10 +99,13 @@ class SegmentCutOperator:
                     self._write_info(seg_dir, seg, fps)
                     continue
 
+                # Use input-side seek so long videos do not need to decode from frame 0
+                # before each cut. We still re-encode the selected range to keep segment
+                # boundaries stable on GOP-compressed inputs.
                 cmd = [
                     "ffmpeg", "-y",
-                    "-i", str(video_path),
                     "-ss", f"{start_sec:.6f}",
+                    "-i", str(video_path),
                     "-t", f"{duration_sec:.6f}",
                     "-map", "0:v:0",
                     "-map", "0:a?",
@@ -116,7 +120,10 @@ class SegmentCutOperator:
                 ]
                 try:
                     subprocess.run(
-                        cmd, capture_output=True, timeout=60, check=True,
+                        cmd,
+                        capture_output=True,
+                        timeout=max(1.0, float(self.config.ffmpeg_timeout_sec)),
+                        check=True,
                     )
                 except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                     log.warning(f"ffmpeg cut failed for seg_{i:03d}: {e}")

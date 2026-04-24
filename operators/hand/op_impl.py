@@ -16,8 +16,8 @@ from ..video_path import resolve_episode_video_path
 
 log = logging.getLogger(__name__)
 
-FONT_PATH = "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"
-COUNT_LABELS = {0: "无手", 1: "单手", 2: "双手"}
+FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+COUNT_LABELS = {0: "no_hands", 1: "one_hand", 2: "two_hands"}
 COUNT_COLORS_RGB = {0: (220, 50, 50), 1: (30, 180, 60), 2: (50, 100, 220)}
 
 
@@ -31,6 +31,41 @@ def _seg_prefix(work_dir: Path) -> str:
     if work_dir.parent.name == "segments":
         return work_dir.name + "_"
     return ""
+
+
+def _build_hand_summary_lines(summary: dict) -> list[str]:
+    lines: list[str] = []
+
+    any_hand_ratio = summary.get("any_hand_ratio")
+    if any_hand_ratio is not None:
+        left_ratio = float(summary.get("left_hand_ratio", 0) or 0)
+        right_ratio = float(summary.get("right_hand_ratio", 0) or 0)
+        both_hands_ratio = float(summary.get("both_hands_ratio", 0) or 0)
+        lines.append(
+            f"Hands visible in {float(any_hand_ratio) * 100:.0f}% of sampled frames "
+            f"(left {left_ratio * 100:.0f}%, right {right_ratio * 100:.0f}%, both {both_hands_ratio * 100:.0f}%)"
+        )
+        return lines
+
+    no_hands_ratio = float(summary.get("ego_0_hands_ratio", 0) or 0)
+    one_hand_ratio = float(summary.get("ego_1_hand_ratio", 0) or 0)
+    two_hands_ratio = float(summary.get("ego_2_hands_ratio", 0) or 0)
+    hands_visible_ratio = max(0.0, 1.0 - no_hands_ratio)
+    lines.append(
+        f"Ego hands visible in {hands_visible_ratio * 100:.0f}% of sampled frames "
+        f"(1 hand {one_hand_ratio * 100:.0f}%, 2 hands {two_hands_ratio * 100:.0f}%)"
+    )
+
+    active_ratio = float(summary.get("active_manipulation_ratio", 0) or 0)
+    if active_ratio > 0:
+        lines.append(
+            f"Active manipulation detected in {active_ratio * 100:.0f}% of sampled frames"
+        )
+    single_operator_ratio = float(summary.get("single_person_operation_ratio", 0) or 0)
+    lines.append(
+        f"Single-person operation in {single_operator_ratio * 100:.0f}% of sampled frames"
+    )
+    return lines
 
 
 def _annotate_hand_frame(frame_bgr: np.ndarray, frame_result: dict, fps: float) -> np.ndarray:
@@ -56,10 +91,10 @@ def _annotate_hand_frame(frame_bgr: np.ndarray, frame_result: dict, fps: float) 
 
     # Top banner: hand count
     if not success or cnt < 0:
-        label = "检测失败"
+        label = "Detection failed"
         bg = (130, 130, 130)
     else:
-        label = f"手部: {cnt}只  ({COUNT_LABELS.get(cnt, str(cnt))})"
+        label = f"Hands: {cnt} ({COUNT_LABELS.get(cnt, str(cnt))})"
         bg = COUNT_COLORS_RGB.get(cnt, (130, 130, 130))
 
     pad_x, pad_y = 18, 10
@@ -203,7 +238,7 @@ class HandAnalysisOperator:
         from .detect_hand_in_frame import detect_hands_in_video
 
         video_path = resolve_episode_video_path(episode_dir)
-        output_path = episode_dir / "hand_detection.json"
+        output_path = episode_dir / "hand_analysis.json"
 
         self._ensure_yolo_model()
 
@@ -222,6 +257,7 @@ class HandAnalysisOperator:
             status="ok", operator=self.name,
             output_files=[str(output_path)],
             metrics=result["summary"],
+            errors=_build_hand_summary_lines(result["summary"]),
         )
 
     # ── VLM backend ────────────────────────────────────────────────────
@@ -230,7 +266,7 @@ class HandAnalysisOperator:
         from .vlm_hand_audit import audit_video
 
         video_path = resolve_episode_video_path(episode_dir)
-        output_path = episode_dir / "vlm_hand_audit.json"
+        output_path = episode_dir / "hand_analysis.json"
 
         result = audit_video(
             video_path,
@@ -245,21 +281,7 @@ class HandAnalysisOperator:
         )
 
         summary = result.get("summary", {})
-        warnings = []
-        no_hands_ratio = summary.get("ego_0_hands_ratio", 0)
-        if no_hands_ratio > 0.8:
-            warnings.append(
-                f"Ego hands absent in {no_hands_ratio*100:.0f}% of sampled frames"
-            )
-        active_ratio = summary.get("active_manipulation_ratio", 0)
-        if active_ratio > 0:
-            warnings.append(
-                f"Active manipulation detected in {active_ratio*100:.0f}% of sampled frames"
-            )
-        single_operator_ratio = summary.get("single_person_operation_ratio", 0)
-        warnings.append(
-            f"Single-person operation in {single_operator_ratio*100:.0f}% of sampled frames"
-        )
+        warnings = _build_hand_summary_lines(summary)
 
         # Export annotated sampled frames into the episode-level hand_samples/ directory.
         ep_root = _episode_root(episode_dir)

@@ -116,6 +116,15 @@ def _update_episode_quality_report(
     report_path.write_text(json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+def _format_ratio(value: float | int | None) -> str:
+    if value is None:
+        return "0%"
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return "0%"
+
+
 @dataclass
 class VideoQualityConfig:
     sample_fps: float | None = None
@@ -165,35 +174,31 @@ class VideoQualityOperator:
 
             blurry = quality.get("blurry_frames", [])
             if blurry:
-                frames_str = ", ".join(
-                    f"#{f['frame_idx']}({f['time_sec']}s, lap={f['laplacian_var']:.1f})"
-                    for f in blurry
-                )
-                errors.append(f"模糊帧 [{len(blurry)}帧]: {frames_str}")
+                blur_ratio = quality.get("blur_ratio")
+                mean_laplacian = quality.get("mean_laplacian")
+                parts = [f"模糊帧 {len(blurry)}帧 ({_format_ratio(blur_ratio)})"]
+                if mean_laplacian is not None:
+                    parts.append(f"平均清晰度 lap={float(mean_laplacian):.1f}")
+                errors.append("，".join(parts))
 
             jitter = stability.get("jitter_frames", [])
             if jitter:
-                frames_str = ", ".join(
-                    f"#{f['frame_idx_from']}-{f['frame_idx_to']}({f['time_sec']}s, "
-                    f"trans={f['translation']:.1f}px, rot={f['rotation']:.4f}rad)"
-                    for f in jitter
+                max_translation = max((float(f.get("translation", 0)) for f in jitter), default=0.0)
+                max_rotation = max((float(f.get("rotation", 0)) for f in jitter), default=0.0)
+                errors.append(
+                    f"剧烈抖动 {len(jitter)}处，最大位移 {max_translation:.1f}px，最大旋转 {max_rotation:.4f}rad"
                 )
-                errors.append(f"剧烈抖动 [{len(jitter)}处]: {frames_str}")
 
             overexposed = exposure.get("overexposed_frames", [])
             underexposed = exposure.get("underexposed_frames", [])
             if overexposed:
-                frames_str = ", ".join(
-                    f"#{f['frame_idx']}({f['time_sec']}s, {f['overexposure_ratio']:.1%})"
-                    for f in overexposed
+                errors.append(
+                    f"过曝帧 {len(overexposed)}帧 ({_format_ratio(exposure.get('overexposure_ratio'))})"
                 )
-                errors.append(f"过曝帧 [{len(overexposed)}帧]: {frames_str}")
             if underexposed:
-                frames_str = ", ".join(
-                    f"#{f['frame_idx']}({f['time_sec']}s, {f['underexposure_ratio']:.1%})"
-                    for f in underexposed
+                errors.append(
+                    f"欠曝帧 {len(underexposed)}帧 ({_format_ratio(exposure.get('underexposure_ratio'))})"
                 )
-                errors.append(f"欠曝帧 [{len(underexposed)}帧]: {frames_str}")
 
             ep_root = _episode_root(episode_dir)
             seg_pfx = _seg_prefix(episode_dir)

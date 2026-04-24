@@ -6,9 +6,9 @@ Detects whether left/right hands are present in each frame of a video.
 
 Usage:
   python detect_hand_in_frame.py --video path/to/rgb.mp4
-  python detect_hand_in_frame.py --video path/to/rgb.mp4 --output hand_detection.json
+  python detect_hand_in_frame.py --video path/to/rgb.mp4 --output hand_analysis.json
   python detect_hand_in_frame.py --video path/to/rgb.mp4 --conf 0.3 --step 1
-  python detect_hand_in_frame.py --episode path/to/episode_dir    # reads configured input video, writes hand_detection.json
+  python detect_hand_in_frame.py --episode path/to/episode_dir    # reads configured input video, writes hand_analysis.json
   python detect_hand_in_frame.py --video path/to/rgb.mp4 --preview   # also generate preview video
 """
 
@@ -172,10 +172,14 @@ def detect_hands_in_video(
     n_left = sum(1 for f in frame_results if f["has_left"])
     n_right = sum(1 for f in frame_results if f["has_right"])
     n_any = sum(1 for f in frame_results if f["has_any_hand"])
+    n_both = sum(1 for f in frame_results if f["has_left"] and f["has_right"])
+    n_none = n - n_any
 
     summary = {
         "video": str(video_path),
+        "total_frames": total_frames,
         "total_frames_processed": n,
+        "processed_frames": n,
         "fps": round(fps, 4),
         "original_resolution": f"{orig_w}x{orig_h}",
         "detection_resolution": f"{det_w}x{det_h}",
@@ -186,9 +190,18 @@ def detect_hands_in_video(
         "frames_with_left_hand": n_left,
         "frames_with_right_hand": n_right,
         "frames_with_any_hand": n_any,
+        "frames_with_at_least_one_hand": n_any,
+        "frames_with_hands": n_any,
+        "frames_with_both_hands": n_both,
+        "frames_with_no_hands": n_none,
+        "hands_detected": n_left + n_right,
+        "max_hands_in_a_frame": 2 if n_both > 0 else 1 if n_any > 0 else 0,
         "left_hand_ratio": round(n_left / n, 4) if n > 0 else 0.0,
         "right_hand_ratio": round(n_right / n, 4) if n > 0 else 0.0,
         "any_hand_ratio": round(n_any / n, 4) if n > 0 else 0.0,
+        "at_least_one_hand_ratio": round(n_any / n, 4) if n > 0 else 0.0,
+        "both_hands_ratio": round(n_both / n, 4) if n > 0 else 0.0,
+        "no_hands_ratio": round(n_none / n, 4) if n > 0 else 0.0,
     }
 
     log.info(
@@ -271,9 +284,9 @@ def generate_preview(
 
 
 def process_episode(episode_dir: Path, conf_thresh: float = 0.3, frame_step: int = 1) -> Path:
-    """Process a single episode directory (reads configured input video, writes hand_detection.json)."""
+    """Process a single episode directory (reads configured input video, writes hand_analysis.json)."""
     video_path = resolve_episode_video_path(episode_dir)
-    output_path = episode_dir / "hand_detection.json"
+    output_path = episode_dir / "hand_analysis.json"
 
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
@@ -305,7 +318,7 @@ def main():
         result = detect_hands_in_video(
             args.video, conf_thresh=args.conf, frame_step=args.step, input_height=args.resize,
         )
-        out = args.output or args.video.with_name("hand_detection.json")
+        out = args.output or args.video.with_name("hand_analysis.json")
         with open(out, "w") as f:
             json.dump(result, f, indent=2)
         log.info(f"Saved to {out}")

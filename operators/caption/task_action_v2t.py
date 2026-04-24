@@ -627,6 +627,96 @@ Output:"""
         return _merge_exact_tasks(task_segments)
 
 
+def _prepare_action_stage(
+    task_segments: list[dict],
+    *,
+    fps: float,
+    action_window_sec: float,
+    action_step_sec: float,
+    action_frames_per_window: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[int]]:
+    action_contexts: list[dict[str, Any]] = []
+    all_action_jobs: list[dict[str, Any]] = []
+    action_frame_ids: list[int] = []
+
+    for task_idx, task_seg in enumerate(task_segments):
+        task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
+        task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
+        seg_start = task_seg["start_frame"]
+        seg_end = task_seg["end_frame"]
+        action_windows = build_windows_for_range(
+            fps,
+            seg_start,
+            seg_end,
+            window_sec=action_window_sec,
+            step_sec=action_step_sec,
+            frames_per_window=action_frames_per_window,
+        )
+        action_jobs = [
+            {
+                "custom_id": f"action_{task_idx}_{window.window_id}",
+                "frame_ids": window.frame_ids,
+                "prompt": build_action_prompt(len(window.frame_ids), window, fps, task_instruction),
+            }
+            for window in action_windows
+        ]
+        action_contexts.append(
+            {
+                "task_idx": task_idx,
+                "task_instruction": task_instruction,
+                "seg_start": seg_start,
+                "seg_end": seg_end,
+                "action_windows": action_windows,
+                "job_count": len(action_jobs),
+            }
+        )
+        all_action_jobs.extend(action_jobs)
+        for job in action_jobs:
+            action_frame_ids.extend(job["frame_ids"])
+
+    return action_contexts, all_action_jobs, action_frame_ids
+
+
+def _build_task_output(
+    action_context: dict[str, Any],
+    action_results: list[dict | None],
+    *,
+    fps: float,
+) -> dict[str, Any]:
+    seg_start = int(action_context["seg_start"])
+    seg_end = int(action_context["seg_end"])
+    action_windows = action_context["action_windows"]
+
+    action_segments = build_segments_from_window_results(
+        action_windows,
+        action_results,
+        fps=fps,
+        range_start=seg_start,
+        range_end=seg_end,
+        payload_field="actions",
+        default_payload="act",
+    )
+
+    atomic_actions = []
+    for action_seg in action_segments:
+        action_caption = normalize_action_caption(
+            action_seg["payload"] if isinstance(action_seg["payload"], str) else "act",
+            "act",
+        )
+        atomic_actions.append(
+            {
+                "caption": action_caption,
+                "frame_interval": [action_seg["start_frame"], action_seg["end_frame"]],
+            }
+        )
+
+    return {
+        "instruction": str(action_context["task_instruction"]),
+        "frame_interval": [seg_start, seg_end],
+        "atomic_actions": atomic_actions,
+    }
+
+
 def segment(
     video_path: str | Path,
     *,
@@ -703,91 +793,43 @@ def segment(
     task_segments = _vlm_refine_tasks(task_segments, batch_enabled=batch_enabled)
 
     output_tasks = [None] * len(task_segments)
-    task_action_contexts: list[tuple[int, dict, list[Window], list[dict[str, Any]]]] = []
-    action_frame_ids: list[int] = []
-    for task_idx, task_seg in enumerate(task_segments):
-        task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
-        task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
-        seg_start = task_seg["start_frame"]
-        seg_end = task_seg["end_frame"]
-        action_windows = build_windows_for_range(
-            fps,
-            seg_start,
-            seg_end,
-            window_sec=action_window_sec,
-            step_sec=action_step_sec,
-            frames_per_window=action_frames_per_window,
-        )
-        action_jobs = [
-            {
-                "custom_id": f"action_{seg_start}_{window.window_id}",
-                "frame_ids": window.frame_ids,
-                "prompt": build_action_prompt(len(window.frame_ids), window, fps, task_instruction),
-            }
-            for window in action_windows
-        ]
-        task_action_contexts.append((task_idx, task_seg, action_windows, action_jobs))
-        for job in action_jobs:
-            action_frame_ids.extend(job["frame_ids"])
+    action_contexts, all_action_jobs, action_frame_ids = _prepare_action_stage(
+        task_segments,
+        fps=fps,
+        action_window_sec=action_window_sec,
+        action_step_sec=action_step_sec,
+        action_frames_per_window=action_frames_per_window,
+    )
     if action_frame_ids:
         frame_provider.ensure_profile(action_frame_ids)
 
-    def _process_task(task_ctx: tuple[int, dict, list[Window], list[dict[str, Any]]]) -> tuple[int, dict]:
-        task_idx, task_seg, action_windows, action_jobs = task_ctx
-        task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
-        task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
-        seg_start = task_seg["start_frame"]
-        seg_end = task_seg["end_frame"]
-        if action_jobs:
-            if batch_enabled:
-                action_results = run_window_batch(
-                    video_path,
-                    action_jobs,
-                    frame_provider=frame_provider,
-                )
-            else:
-                action_results = run_window_direct(
-                    video_path,
-                    action_jobs,
-                    max_workers=max_workers,
-                    frame_provider=frame_provider,
-                )
+    if all_action_jobs:
+        if batch_enabled:
+            all_action_results = run_window_batch(
+                video_path,
+                all_action_jobs,
+                frame_provider=frame_provider,
+            )
         else:
-            action_results = []
+            all_action_results = run_window_direct(
+                video_path,
+                all_action_jobs,
+                max_workers=max_workers,
+                frame_provider=frame_provider,
+            )
+    else:
+        all_action_results = []
 
-        action_segments = build_segments_from_window_results(
-            action_windows,
-            action_results,
+    cursor = 0
+    for action_context in action_contexts:
+        job_count = int(action_context["job_count"])
+        task_results = all_action_results[cursor:cursor + job_count]
+        cursor += job_count
+        output_tasks[int(action_context["task_idx"])] = _build_task_output(
+            action_context,
+            task_results,
             fps=fps,
-            range_start=seg_start,
-            range_end=seg_end,
-            payload_field="actions",
-            default_payload="act",
         )
-
-        atomic_actions = []
-        for action_seg in action_segments:
-            action_caption = normalize_action_caption(
-                action_seg["payload"] if isinstance(action_seg["payload"], str) else "act",
-                "act",
-            )
-            atomic_actions.append(
-                {
-                    "caption": action_caption,
-                    "frame_interval": [action_seg["start_frame"], action_seg["end_frame"]],
-                }
-            )
-
-        return task_idx, {
-            "instruction": task_instruction,
-            "frame_interval": [seg_start, seg_end],
-            "atomic_actions": atomic_actions,
-        }
-
-    if task_segments:
-        with ThreadPoolExecutor(max_workers=min(max(1, max_workers), len(task_segments))) as pool:
-            for task_idx, task_output in pool.map(_process_task, task_action_contexts):
-                output_tasks[task_idx] = task_output
 
     return {
         "scene": scene,
@@ -928,44 +970,20 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
     )
 
     output_tasks = [None] * len(task_segments)
-    task_action_contexts: list[tuple[int, dict, list[Window], list[dict[str, Any]]]] = []
-    action_frame_ids: list[int] = []
-    for task_idx, task_seg in enumerate(task_segments):
-        task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
-        task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
-        seg_start = task_seg["start_frame"]
-        seg_end = task_seg["end_frame"]
-        action_windows = build_windows_for_range(
-            fps,
-            seg_start,
-            seg_end,
-            window_sec=float(state["action_window_sec"]),
-            step_sec=float(state["action_step_sec"]),
-            frames_per_window=int(state["action_frames_per_window"]),
-        )
-        action_jobs = [
-            {
-                "custom_id": f"action_{seg_start}_{window.window_id}",
-                "frame_ids": window.frame_ids,
-                "prompt": build_action_prompt(len(window.frame_ids), window, fps, task_instruction),
-            }
-            for window in action_windows
-        ]
-        task_action_contexts.append((task_idx, task_seg, action_windows, action_jobs))
-        for job in action_jobs:
-            action_frame_ids.extend(job["frame_ids"])
+    action_contexts, all_action_jobs, action_frame_ids = _prepare_action_stage(
+        task_segments,
+        fps=fps,
+        action_window_sec=float(state["action_window_sec"]),
+        action_step_sec=float(state["action_step_sec"]),
+        action_frames_per_window=int(state["action_frames_per_window"]),
+    )
     if action_frame_ids:
         frame_provider.ensure_profile(action_frame_ids)
 
-    def _process_task(task_ctx: tuple[int, dict, list[Window], list[dict[str, Any]]]) -> tuple[int, dict]:
-        task_idx, task_seg, action_windows, action_jobs = task_ctx
-        task_payload = task_seg["payload"] if isinstance(task_seg["payload"], dict) else {}
-        task_instruction = str(task_payload.get("instruction") or "perform the current task").strip()
-        seg_start = task_seg["start_frame"]
-        seg_end = task_seg["end_frame"]
+    if all_action_jobs:
         action_requests = build_window_requests(
             video_path,
-            action_jobs,
+            all_action_jobs,
             frame_provider=frame_provider,
         )
         if action_requests:
@@ -978,43 +996,22 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
                 )
             if action_result.get("status") != "completed":
                 raise RuntimeError(f"Action batch ended with status: {action_result.get('status')}")
-            action_results = parse_window_results(action_jobs, action_result.get("results", {}))
+            all_action_results = parse_window_results(all_action_jobs, action_result.get("results", {}))
         else:
-            action_results = []
+            all_action_results = [None] * len(all_action_jobs)
+    else:
+        all_action_results = []
 
-        action_segments = build_segments_from_window_results(
-            action_windows,
-            action_results,
+    cursor = 0
+    for action_context in action_contexts:
+        job_count = int(action_context["job_count"])
+        task_results = all_action_results[cursor:cursor + job_count]
+        cursor += job_count
+        output_tasks[int(action_context["task_idx"])] = _build_task_output(
+            action_context,
+            task_results,
             fps=fps,
-            range_start=seg_start,
-            range_end=seg_end,
-            payload_field="actions",
-            default_payload="act",
         )
-
-        atomic_actions = []
-        for action_seg in action_segments:
-            action_caption = normalize_action_caption(
-                action_seg["payload"] if isinstance(action_seg["payload"], str) else "act",
-                "act",
-            )
-            atomic_actions.append(
-                {
-                    "caption": action_caption,
-                    "frame_interval": [action_seg["start_frame"], action_seg["end_frame"]],
-                }
-            )
-
-        return task_idx, {
-            "instruction": task_instruction,
-            "frame_interval": [seg_start, seg_end],
-            "atomic_actions": atomic_actions,
-        }
-
-    if task_segments:
-        with ThreadPoolExecutor(max_workers=min(max(1, int(state["max_workers"])), len(task_segments))) as pool:
-            for task_idx, task_output in pool.map(_process_task, task_action_contexts):
-                output_tasks[task_idx] = task_output
 
     log.info("[%s] Scene: %s", video_path.stem, scene)
     return {

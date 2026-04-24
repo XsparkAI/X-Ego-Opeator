@@ -10,14 +10,14 @@
 
 # ── 数据集源（Episode）配置 ───────────────────────────────────────────
 # 选项 1：明确指定 episode 目录（支持单个路径或列表；目录内需包含 input_video_path 指定的视频）
-episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/test_episode_30s"
+episodes: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/tmp/bytedance/家务/擦桌子"
 
 # 选项 2：自动扫描根目录下的所有数据集目录
 # （包含 input_video_path 指定视频文件的子目录将被视为一个独立的数据集）
 # episode_root: "/home/pc/Desktop/zijian/ego/Ego-X_Operator/test_video/lic"
 
 # 每个 episode 内输入视频的相对路径。
-input_video_path: rgb.mp4
+input_video_path: cam_head.mp4
 
 # ── VLM API 配置 ───────────────────────────────────────────────────
 # 所有 VLM 算子统一走 operators/caption/vlm_api.py 这一层。
@@ -137,7 +137,7 @@ operators:
 
   video_segmentation:
     enabled: true            # VLM 分段标注
-    method: segment_v2t      # "segment_v2t" | "task_action_v2t"
+    method: task_action_v2t      # "segment_v2t" | "task_action_v2t"
     batch_enabled: false      # true=默认 batch 提交；false=直接请求，不走 batch
     batch_poll_interval_sec: 20
     window_sec: 10.0
@@ -152,7 +152,7 @@ operators:
     action_frames_per_window: 8
 
   segment_cut:
-    enabled: false           # 按 caption_v2t.json 裁剪短视频；若 video_segmentation 关闭会自动跳过
+    enabled: true           # 按 caption_v2t.json 裁剪短视频；若 video_segmentation 关闭会自动跳过
     min_duration_sec: 0.5    # 跳过短于此秒数的片段
     granularity: task  # "atomic_action" | "task"
 
@@ -172,7 +172,7 @@ operators:
     #   "yolo" — YOLO 逐帧检测，速度快，输出 bbox + 置信度（默认）
     #   "vlm"  — VLM 语义分析，能区分拍摄者/他人手部、检测遮挡，但依赖 API
     #            默认直接在当前视频上均匀抽帧；若前面发生 fan-out，则会处理 segment 视频
-    method: vlm
+    method: yolo
     save_hand_samples: false   # 是否导出VLM采样帧可视化，默认关闭
     batch_enabled: false        # 是否使用batch提交
     max_workers: 12             # 非 batch 模式下控制并发；batch 模式下仅保留为兼容项
@@ -205,7 +205,7 @@ operators:
     face_thresh: 0.4      # 覆盖默认的人脸检测阈值
     lp_thresh: 0.3        # 覆盖默认的车牌检测阈值
     # ── YOLO 专用参数（仅 detector_backend=yolo 时生效）──
-    yolo_face_model_path: weights/yolov8s-face-lindevs.pt
+    yolo_face_model_path: weights/yolo26s.pt
     yolo_lp_model_path: weights/yolo_lp.pt
     yolo_conf_thresh: 0.25
     yolo_input_size: 640
