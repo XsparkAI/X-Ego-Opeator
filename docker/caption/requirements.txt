@@ -1,0 +1,4 @@
+numpy>=1.24,<3
+opencv-python-headless>=4.8,<5
+httpx[socks]>=0.27,<1
+openai>=1.30,<2

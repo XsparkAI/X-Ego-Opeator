@@ -155,7 +155,7 @@ def build_scene_request(
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
             from frame_cache.cache_utils import ensure_cached_frame_b64
 
-        image_b64_list = ensure_cached_frame_b64(video_path.parent, frame_ids) or []
+        image_b64_list = ensure_cached_frame_b64(video_path, frame_ids) or []
     if not image_b64_list:
         return None
 

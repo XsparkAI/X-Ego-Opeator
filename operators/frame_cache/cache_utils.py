@@ -11,7 +11,7 @@ from typing import Callable, Iterable
 import cv2
 import numpy as np
 
-from ..video_path import resolve_episode_video_path
+from ..video_path import VIDEO_SUFFIXES, resolve_episode_video_path
 
 from ..video_utils import apply_rotation, get_manual_rotation
 
@@ -176,6 +176,8 @@ def build_stride_frame_ids(nframes: int, frame_step: int) -> list[int]:
 
 
 def cache_root(episode_dir: Path) -> Path:
+    if episode_dir.is_file() or episode_dir.suffix.lower() in VIDEO_SUFFIXES:
+        return episode_dir.parent / CACHE_DIRNAME / episode_dir.stem
     return episode_dir / CACHE_DIRNAME
 
 
@@ -310,8 +312,8 @@ def _build_transformed_cache(
 
     root = cache_root(episode_dir)
     prof_dir = profile_dir(episode_dir, profile)
-    root.mkdir(exist_ok=True)
-    prof_dir.mkdir(exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
+    prof_dir.mkdir(parents=True, exist_ok=True)
 
     existing_ids = {
         int(fid)

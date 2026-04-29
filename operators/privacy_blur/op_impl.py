@@ -181,6 +181,11 @@ class PrivacyBlurOperator:
                     yolo_input_size=self.config.yolo_input_size,
                     detectors=self._detectors,
                 )
+                summary_path = episode_dir / "privacy_blur_summary.json"
+                summary_path.write_text(
+                    json.dumps(summary, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
 
                 # Segment-level runs opportunistically assemble an episode-level blurred video.
                 ep_root = _episode_root(episode_dir)
@@ -192,7 +197,7 @@ class PrivacyBlurOperator:
 
                 return OperatorResult(
                     status="ok", operator=self.name,
-                    output_files=[str(output_path)],
+                    output_files=[str(output_path), str(summary_path)],
                     metrics=summary,
                 )
             except Exception as e:

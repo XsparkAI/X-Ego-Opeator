@@ -165,7 +165,7 @@ def extract_frames_b64(
     from ..frame_cache.cache_utils import ensure_cached_frame_b64
     from ..video_utils import get_manual_rotation, apply_rotation
 
-    cached = ensure_cached_frame_b64(Path(video_path).parent, frame_ids)
+    cached = ensure_cached_frame_b64(Path(video_path), frame_ids)
     if cached:
         return cached
 
@@ -190,7 +190,7 @@ def save_frames_as_tmp_jpg(video_path: str, frame_ids: list[int], tmp_dir: str) 
     from ..frame_cache.cache_utils import ensure_cached_frame_paths
     from ..video_utils import get_manual_rotation, apply_rotation
 
-    cached = ensure_cached_frame_paths(Path(video_path).parent, frame_ids)
+    cached = ensure_cached_frame_paths(Path(video_path), frame_ids)
     if cached:
         return cached
 
@@ -592,7 +592,7 @@ def segment(
     cap.release()
 
     log.info(f"[{name}] {nframes} frames, {fps:.0f} fps, {nframes / fps:.1f}s")
-    frame_provider = FrameProvider(video_path.parent)
+    frame_provider = FrameProvider(video_path)
 
     # Build windows
     windows = build_windows(
@@ -686,7 +686,7 @@ def submit_segment_job(
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     cap.release()
-    frame_provider = FrameProvider(video_path.parent)
+    frame_provider = FrameProvider(video_path)
 
     windows = build_windows(
         fps,

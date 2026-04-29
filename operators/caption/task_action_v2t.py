@@ -183,7 +183,7 @@ def save_frames_as_tmp_jpg(video_path: str | Path, frame_ids: list[int], tmp_dir
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from video_utils import apply_rotation, get_manual_rotation
 
-    cached = ensure_cached_frame_paths(Path(video_path).parent, frame_ids)
+    cached = ensure_cached_frame_paths(Path(video_path), frame_ids)
     if cached:
         return cached
 
@@ -232,7 +232,7 @@ def extract_frames_b64(
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from video_utils import apply_rotation, get_manual_rotation
 
-    cached = ensure_cached_frame_b64(Path(video_path).parent, frame_ids)
+    cached = ensure_cached_frame_b64(Path(video_path), frame_ids)
     if cached:
         return cached
 
@@ -734,7 +734,7 @@ def segment(
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     fps, nframes = read_video_info(video_path)
-    frame_provider = FrameProvider(video_path.parent)
+    frame_provider = FrameProvider(video_path)
 
     task_windows = build_windows_for_range(
         fps,
@@ -839,7 +839,7 @@ def segment(
 
 def process_video(video_path: Path) -> dict:
     caption = segment(video_path)
-    out_path = Path(video_path).resolve().parent / "caption_v2t.json"
+    out_path = Path(video_path).resolve().parent / "caption.json"
     out_path.write_text(json.dumps(caption, ensure_ascii=False, indent=2), encoding="utf-8")
     log.info("Saved: %s", out_path)
     return caption
@@ -861,7 +861,7 @@ def submit_segment_job(
         raise FileNotFoundError(f"Video not found: {video_path}")
 
     fps, nframes = read_video_info(video_path)
-    frame_provider = FrameProvider(video_path.parent)
+    frame_provider = FrameProvider(video_path)
     task_windows = build_windows_for_range(
         fps,
         0,
@@ -926,7 +926,7 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
     video_path = Path(state["video_path"])
     fps = float(state["fps"])
     nframes = int(state["nframes"])
-    frame_provider = FrameProvider(video_path.parent)
+    frame_provider = FrameProvider(video_path)
 
     task_windows = [Window(**window) for window in state.get("task_windows", [])]
     task_jobs = state.get("task_jobs", [])

@@ -217,6 +217,7 @@ Current limitation:
 - when only a BOS prefix is available, the adapter lists objects under that prefix and prefers `rgb.mp4`, then `cam_head.mp4`, then other video files
 - VLM model env/config now uses `VLM_MODEL`; old `VLM_HAND_MODEL` is still accepted as a compatibility alias
 - if no VLM model is specified, the provider-specific fallback is `qwen3.5-flash` for `dashscope` and `doubao-seed-2-0-lite-260215` for `volcengine_ark`
+- VLM platform mode defaults to direct requests (`no_batch=true`) for every provider; set `no_batch=false` explicitly only when the provider supports async batch submission and the workflow should wait for batch completion
 
 Example local simulation:
 

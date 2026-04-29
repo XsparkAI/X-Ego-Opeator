@@ -5,16 +5,22 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+for candidate in (SCRIPT_DIR, SCRIPT_DIR.parent, SCRIPT_DIR.parent.parent):
+    if str(candidate) not in sys.path:
+        sys.path.insert(0, str(candidate))
+
 try:
-    from runner import run_hand_analysis
-except ImportError:
-    run_hand_analysis = None
+    from runner import run_caption
+except ModuleNotFoundError:
+    from .runner import run_caption
 
 JSON_SUFFIXES = {".json"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -142,9 +148,7 @@ def _write_bcecmd_config(config_dir: Path, context: dict) -> None:
 
     config_dir.mkdir(parents=True, exist_ok=True)
     endpoint_config = _bcecmd_config_from_endpoint(str(context.get("endpoint", "")))
-    config_path = config_dir / "config"
-    credentials_path = config_dir / "credentials"
-    config_path.write_text(
+    (config_dir / "config").write_text(
         (
             "[Defaults]\n"
             f"Domain = {endpoint_config['domain']}\n"
@@ -160,7 +164,7 @@ def _write_bcecmd_config(config_dir: Path, context: dict) -> None:
         ),
         encoding="utf-8",
     )
-    credentials_path.write_text(
+    (config_dir / "credentials").write_text(
         f"[Defaults]\nAk = {ak}\nSk = {sk}\nSts = \n",
         encoding="utf-8",
     )
@@ -175,15 +179,11 @@ def _mask_secret(value: str) -> str:
 
 
 def _debug_log_bos_credentials(context: dict, args: list[str]) -> None:
-    endpoint = context.get("endpoint", "")
-    ak = context.get("ak", "")
-    sk = context.get("sk", "")
-    command = " ".join(args)
-
     print(
         "BOS credential debug "
-        f"command={command} endpoint={endpoint} "
-        f"AccessKey={_mask_secret(ak)} SecretKey={_mask_secret(sk)}",
+        f"command={' '.join(args)} endpoint={context.get('endpoint', '')} "
+        f"AccessKey={_mask_secret(str(context.get('ak', '')))} "
+        f"SecretKey={_mask_secret(str(context.get('sk', '')))}",
         file=sys.stderr,
         flush=True,
     )
@@ -202,11 +202,7 @@ def _run_bcecmd(context: dict, args: list[str]) -> str:
     env["HOME"] = str(home_dir)
 
     _debug_log_bos_credentials(context, args)
-    print(
-        f"[egox] about to run bcecmd: {' '.join(args)}",
-        file=sys.stderr,
-        flush=True,
-    )
+    print(f"[egox] about to run bcecmd: {' '.join(args)}", file=sys.stderr, flush=True)
 
     try:
         completed = subprocess.run(
@@ -227,6 +223,7 @@ def _run_bcecmd(context: dict, args: list[str]) -> str:
         )
         raise RuntimeError(f"bcecmd {' '.join(args)} failed: {details}") from exc
 
+    print(f"[egox] bcecmd completed: {' '.join(args)}", file=sys.stderr, flush=True)
     return completed.stdout
 
 
@@ -264,11 +261,35 @@ def _download_bos_object(context: dict, bucket: str, key: str, target_dir: Path)
     basename = Path(key).name or "input.bin"
     local_path = target_dir / f"{digest}-{basename}"
     if not local_path.exists():
+        print(
+            f"[egox] downloading BOS object bos://{bucket}/{key} -> {local_path}",
+            file=sys.stderr,
+            flush=True,
+        )
         _run_bcecmd(
             context,
             ["bos", "cp", f"bos://{bucket}/{key}", str(local_path), "--yes", "--disable-bar"],
         )
+    else:
+        print(f"[egox] using cached BOS object: {local_path}", file=sys.stderr, flush=True)
     return local_path
+
+
+def _prepare_caption_runtime_video(shared_video_path: Path, cache_root: Path) -> Path:
+    digest = hashlib.sha1(str(shared_video_path).encode("utf-8")).hexdigest()[:12]
+    runtime_dir = cache_root / "caption_runtime" / digest
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    target_name = shared_video_path.name.split("-", 1)[-1] or shared_video_path.name
+    runtime_video_path = runtime_dir / target_name
+    if runtime_video_path.exists():
+        return runtime_video_path
+
+    try:
+        runtime_video_path.symlink_to(shared_video_path)
+    except OSError:
+        shutil.copy2(shared_video_path, runtime_video_path)
+    return runtime_video_path
 
 
 def _resolve_bos_runtime_input(uri: str, bos_context: dict) -> tuple[str, Path] | None:
@@ -277,7 +298,7 @@ def _resolve_bos_runtime_input(uri: str, bos_context: dict) -> tuple[str, Path] 
 
     if Path(key).suffix.lower() in VIDEO_SUFFIXES:
         local_video = _download_bos_object(bos_context, bucket, key, temp_root)
-        return ("video", local_video)
+        return ("video", _prepare_caption_runtime_video(local_video, temp_root))
 
     prefix = key.rstrip("/")
     if prefix:
@@ -288,7 +309,7 @@ def _resolve_bos_runtime_input(uri: str, bos_context: dict) -> tuple[str, Path] 
         return None
 
     local_video = _download_bos_object(bos_context, bucket, candidates[0], temp_root)
-    return ("video", local_video)
+    return ("video", _prepare_caption_runtime_video(local_video, temp_root))
 
 
 def _normalize_artifacts(payload: object) -> list[dict]:
@@ -314,17 +335,6 @@ def _load_node_data() -> dict:
     if not isinstance(data, dict):
         raise RuntimeError("NODE_DATA_JSON must decode to a JSON object")
     return data
-
-
-def _pick_hyperparam(hyperparams: dict, *keys: str, default=None):
-    for key in keys:
-        if key in hyperparams:
-            return hyperparams[key]
-        lowered = key.lower()
-        for existing_key, value in hyperparams.items():
-            if str(existing_key).lower() == lowered:
-                return value
-    return default
 
 
 def _as_bool(value: object, default: bool = False) -> bool:
@@ -593,7 +603,7 @@ def _resolve_runtime_input(artifact: dict, hyperparams: dict) -> tuple[str, Path
         )
 
     raise RuntimeError(
-        "Hand analysis custom operator requires a local video file or episode directory "
+        "Caption custom operator requires a local video file or episode directory "
         "from artifact.path, artifact.data, artifact JSON payloads, or dataRef payload/manifests/partitions. "
         + "Checked: "
         + "; ".join(candidate_details)
@@ -601,47 +611,54 @@ def _resolve_runtime_input(artifact: dict, hyperparams: dict) -> tuple[str, Path
 
 
 def _build_args(kind: str, input_path: Path, output_path: Path, hyperparams: dict) -> argparse.Namespace:
-    backend = _pick_runtime_value(
+    method = _normalize_method(_pick_runtime_value(
         hyperparams,
-        "HAND_BACKEND",
-        "BACKEND",
         "METHOD",
         "method",
-        default="yolo",
-    ).lower()
+        "CAPTION_METHOD",
+        "caption_method",
+        default="task",
+    ))
+    vlm_provider = _pick_runtime_value(
+        hyperparams,
+        "VLM_API_PROVIDER",
+        "vlm_api_provider",
+        default=os.getenv("VLM_API_PROVIDER", ""),
+    )
     no_batch_value = _pick_runtime_value(
         hyperparams,
         "NO_BATCH",
         "no_batch",
     )
     no_batch = _as_bool(no_batch_value, default=True)
+    if vlm_provider.strip().lower() == "volcengine_ark":
+        no_batch = True
 
     return argparse.Namespace(
-        backend=backend if backend in {"yolo", "vlm"} else "yolo",
+        method=method if method in {"task", "atomic_action"} else "task",
         video=input_path if kind == "video" else None,
         episode=input_path if kind == "episode" else None,
         output=output_path,
-        frame_step=_as_int(
-            _pick_runtime_value(
-                hyperparams,
-                "FRAME_STEP",
-                "STEP",
-                "yolo_frame_step",
-                "vlm_sample_frame_step",
-            ),
-            1,
-        ),
-        conf=_as_float(_pick_runtime_value(hyperparams, "CONF", "conf_thresh"), 0.3),
-        resize=_as_int(_pick_runtime_value(hyperparams, "RESIZE", "input_height"), 720),
         preview=_as_bool(_pick_runtime_value(hyperparams, "PREVIEW", "preview"), default=False),
-        max_workers=_as_int(_pick_runtime_value(hyperparams, "MAX_WORKERS", "max_workers"), 4),
+        max_workers=_as_int(_pick_runtime_value(hyperparams, "MAX_WORKERS", "max_workers"), 8),
         no_batch=no_batch,
-        vlm_provider=_pick_runtime_value(
-            hyperparams,
-            "VLM_API_PROVIDER",
-            "vlm_api_provider",
-            default=os.getenv("VLM_API_PROVIDER", ""),
+        window_sec=_as_float(_pick_runtime_value(hyperparams, "WINDOW_SEC", "window_sec"), 10.0),
+        step_sec=_as_float(_pick_runtime_value(hyperparams, "STEP_SEC", "step_sec"), 5.0),
+        frames_per_window=_as_int(_pick_runtime_value(hyperparams, "FRAMES_PER_WINDOW", "frames_per_window"), 12),
+        task_name=_pick_runtime_value(hyperparams, "TASK_NAME", "task_name", default=""),
+        task_window_sec=_as_float(_pick_runtime_value(hyperparams, "TASK_WINDOW_SEC", "task_window_sec"), 12.0),
+        task_step_sec=_as_float(_pick_runtime_value(hyperparams, "TASK_STEP_SEC", "task_step_sec"), 6.0),
+        task_frames_per_window=_as_int(
+            _pick_runtime_value(hyperparams, "TASK_FRAMES_PER_WINDOW", "task_frames_per_window"),
+            12,
         ),
+        action_window_sec=_as_float(_pick_runtime_value(hyperparams, "ACTION_WINDOW_SEC", "action_window_sec"), 6.0),
+        action_step_sec=_as_float(_pick_runtime_value(hyperparams, "ACTION_STEP_SEC", "action_step_sec"), 3.0),
+        action_frames_per_window=_as_int(
+            _pick_runtime_value(hyperparams, "ACTION_FRAMES_PER_WINDOW", "action_frames_per_window"),
+            8,
+        ),
+        vlm_provider=vlm_provider,
         vlm_api_key=_pick_runtime_value(
             hyperparams,
             "VLM_API_KEY",
@@ -662,22 +679,24 @@ def _build_args(kind: str, input_path: Path, output_path: Path, hyperparams: dic
             hyperparams,
             "VLM_MODEL",
             "vlm_model",
-            "VLM_HAND_MODEL",
-            "vlm_hand_model",
+            "VLM_CAPTION_MODEL",
+            "vlm_caption_model",
             "VLM_DEFAULT_MODEL",
-            default=os.getenv("VLM_MODEL", os.getenv("VLM_HAND_MODEL", os.getenv("VLM_DEFAULT_MODEL", ""))),
+            default=os.getenv("VLM_MODEL", os.getenv("VLM_CAPTION_MODEL", os.getenv("VLM_DEFAULT_MODEL", ""))),
         ),
     )
 
 
-def _result_summary(runtime_result: dict) -> dict:
-    raw = runtime_result.get("result")
-    backend = runtime_result.get("backend")
-    if isinstance(raw, dict):
-        summary = raw.get("summary")
-        if isinstance(summary, dict):
-            return summary
-    return {"backend": backend}
+def _normalize_method(method: str | None) -> str:
+    normalized = str(method or "task").strip().lower()
+    aliases = {
+        "segment_v2t": "task",
+        "task_v2t": "task",
+        "task_action_v2t": "atomic_action",
+        "atomic": "atomic_action",
+        "atomic-action": "atomic_action",
+    }
+    return aliases.get(normalized, normalized)
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -825,19 +844,20 @@ def _resolve_platform_video_inputs(artifact: dict, hyperparams: dict) -> list[tu
     return [_resolve_runtime_input(artifact, hyperparams)]
 
 
-def _hand_output_name(input_path: Path, index: int, total: int) -> str:
+def _caption_output_name(input_path: Path, index: int, total: int) -> str:
     if total == 1:
-        return "hand_analysis.json"
-    return f"{input_path.stem}_hand_analysis.json"
+        return "caption.json"
+    return f"{input_path.stem}_caption.json"
 
 
 def _log_runtime_args(args: argparse.Namespace) -> None:
     print(
         "[egox] resolved runtime args "
-        f"backend={args.backend} "
-        f"frame_step={args.frame_step} "
+        f"version={os.getenv('CAPTION_DOCKER_VERSION', '<unset>')} "
+        f"method={args.method} "
         f"no_batch={args.no_batch} "
         f"max_workers={args.max_workers} "
+        f"preview={args.preview} "
         f"vlm_provider={args.vlm_provider or '<empty>'} "
         f"vlm_model={args.vlm_model or '<empty>'}",
         file=sys.stderr,
@@ -847,23 +867,41 @@ def _log_runtime_args(args: argparse.Namespace) -> None:
 
 def _runtime_args_summary(args: argparse.Namespace) -> dict:
     return {
-        "backend": args.backend,
-        "frameStep": args.frame_step,
+        "method": args.method,
         "noBatch": args.no_batch,
         "maxWorkers": args.max_workers,
+        "preview": args.preview,
+        "taskName": args.task_name or None,
+        "windowSec": args.window_sec,
+        "stepSec": args.step_sec,
+        "framesPerWindow": args.frames_per_window,
+        "taskWindowSec": args.task_window_sec,
+        "taskStepSec": args.task_step_sec,
+        "taskFramesPerWindow": args.task_frames_per_window,
+        "actionWindowSec": args.action_window_sec,
+        "actionStepSec": args.action_step_sec,
+        "actionFramesPerWindow": args.action_frames_per_window,
         "vlmProvider": args.vlm_provider or None,
         "vlmModel": args.vlm_model or None,
     }
 
 
-def main() -> None:
-    if run_hand_analysis is None:
-        raise RuntimeError("Cannot import run_hand_analysis from runner")
+def _caption_artifact_data(summary: dict, output_path: Path) -> dict:
+    return {
+        "method": summary.get("method"),
+        "scene": summary.get("scene"),
+        "numTasks": summary.get("numTasks"),
+        "numActions": summary.get("numActions"),
+        "previewGenerated": summary.get("previewGenerated"),
+        "payloadPath": str(output_path),
+    }
 
+
+def main() -> None:
     output_dir = Path(os.environ["OUTPUT_DIR"])
     result_output_path = Path(os.environ["RESULT_OUTPUT_PATH"])
     stage_manifest_path = Path(os.environ["STAGE_MANIFEST_PATH"])
-    node_label = os.getenv("NODE_LABEL", "hand_analysis")
+    node_label = os.getenv("NODE_LABEL", "caption")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     node_data = _load_node_data()
@@ -878,7 +916,7 @@ def main() -> None:
     summaries = []
     first_args = None
     for index, (input_kind, input_path) in enumerate(video_inputs, start=1):
-        output_filename = _hand_output_name(input_path, index, len(video_inputs))
+        output_filename = _caption_output_name(input_path, index, len(video_inputs))
         output_name = _pick_runtime_value(hyperparams, "OUTPUT_NAME", "output_name", default="").strip()
         if output_name and len(video_inputs) == 1:
             output_filename = output_name if output_name.endswith(".json") else f"{output_name}.json"
@@ -887,19 +925,24 @@ def main() -> None:
         if index == 1:
             _log_runtime_args(args)
             first_args = args
-        runtime_result = run_hand_analysis(args)
-        summary = _result_summary(runtime_result)
+
+        runtime_result = run_caption(args)
         runtime_args = _runtime_args_summary(args)
-        summaries.append(summary)
+        caption_result = runtime_result.get("result") or {}
+        summary = runtime_result.get("summary") or {}
+        summaries.append(_caption_artifact_data(summary, runtime_result["output_path"]))
+        _write_json(runtime_result["output_path"], caption_result)
         output_artifacts.append({
             "name": artifact_path.name,
             "type": "json",
             "path": str(runtime_result["output_path"]),
             "portId": "out-1",
             "portName": "result",
-            "data": summary,
+            "data": _caption_artifact_data(summary, runtime_result["output_path"]),
+            "dataRef": {"payloadPath": str(runtime_result["output_path"])},
             "metadata": {
-                "backend": runtime_result["backend"],
+                "method": runtime_result["method"],
+                "captionDockerVersion": os.getenv("CAPTION_DOCKER_VERSION", "<unset>"),
                 "runtimeArgs": runtime_args,
                 "inputKind": input_kind,
                 "inputPath": str(input_path),
@@ -908,12 +951,14 @@ def main() -> None:
                 "inputPortName": source_artifact.get("portName"),
                 "inputIndex": index,
                 "inputCount": len(video_inputs),
+                "scene": summary.get("scene"),
+                "previewPath": str(runtime_result["preview_path"]) if runtime_result.get("preview_path") else None,
             },
         })
 
     if len(video_inputs) > 1:
-        aggregate_path = output_dir / "hand_analysis_manifest.json"
-        aggregate_data = {"inputCount": len(video_inputs), "results": summaries}
+        aggregate_path = output_dir / "caption_manifest.json"
+        aggregate_data = {"inputCount": len(video_inputs), "captions": summaries}
         _write_json(aggregate_path, aggregate_data)
         output_artifacts.append({
             "name": aggregate_path.name,
@@ -922,6 +967,7 @@ def main() -> None:
             "portId": "out-1",
             "portName": "result",
             "data": aggregate_data,
+            "dataRef": {"payloadPath": str(aggregate_path)},
             "metadata": {"inputCount": len(video_inputs)},
         })
 
@@ -931,11 +977,12 @@ def main() -> None:
                 "timestamp": _now_iso(),
                 "level": "INFO",
                 "message": (
-                    "hand_analysis resolved runtime args: "
-                    f"backend={first_args.backend if first_args else '<empty>'}, "
-                    f"frame_step={first_args.frame_step if first_args else '<empty>'}, "
+                    "caption resolved runtime args: "
+                    f"version={os.getenv('CAPTION_DOCKER_VERSION', '<unset>')}, "
+                    f"method={first_args.method if first_args else '<empty>'}, "
                     f"no_batch={first_args.no_batch if first_args else '<empty>'}, "
                     f"max_workers={first_args.max_workers if first_args else '<empty>'}, "
+                    f"preview={first_args.preview if first_args else '<empty>'}, "
                     f"vlm_provider={(first_args.vlm_provider or '<empty>') if first_args else '<empty>'}, "
                     f"vlm_model={(first_args.vlm_model or '<empty>') if first_args else '<empty>'}, "
                     f"input_count={len(video_inputs)}"
@@ -945,9 +992,9 @@ def main() -> None:
             {
                 "timestamp": _now_iso(),
                 "level": "INFO",
-                "message": "hand_analysis custom operator completed successfully",
+                "message": "caption custom operator completed successfully",
                 "operator": node_label,
-            }
+            },
         ],
         "artifacts": output_artifacts,
         "resourceSeries": [],

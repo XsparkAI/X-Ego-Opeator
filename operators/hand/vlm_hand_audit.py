@@ -520,7 +520,7 @@ def audit_video(
 
     frame_ids, fps, total_frames = sample_frames(str(video_path), frame_step)
     duration = total_frames / fps
-    frame_provider = FrameProvider(video_path.parent)
+    frame_provider = FrameProvider(video_path)
     effective_batch_enabled = batch_enabled and provider_supports_batch_api()
 
     log.info(f"Video: {video_path.name}, {total_frames} frames @ {fps:.1f} fps, duration={duration:.1f}s")
