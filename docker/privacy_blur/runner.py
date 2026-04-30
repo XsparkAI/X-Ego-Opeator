@@ -103,7 +103,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--yolo-conf-thresh", type=float, default=float(os.getenv("YOLO_CONF_THRESH", "0.25")))
     parser.add_argument("--yolo-input-size", type=int, default=int(os.getenv("YOLO_INPUT_SIZE", "960")))
-    parser.add_argument("--use-frame-cache", action="store_true", default=_bool_from_env("USE_FRAME_CACHE"))
+    parser.add_argument(
+        "--use-frame-cache",
+        action=argparse.BooleanOptionalAction,
+        default=_bool_from_env("USE_FRAME_CACHE", True),
+    )
     parser.add_argument(
         "--frame-cache-num-workers",
         type=int,

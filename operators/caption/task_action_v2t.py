@@ -6,10 +6,11 @@ This script keeps the existing segment_v2t variants untouched and provides a
 new optional captioning method that outputs the unified caption schema:
 
 {
+  "instruction": "...",
   "scene": "...",
   "tasks": [
     {
-      "instruction": "...",
+      "caption": "...",
       "frame_interval": [0, 120],
       "atomic_actions": [{"caption": "...", "frame_interval": [0, 20]}]
     }
@@ -711,10 +712,20 @@ def _build_task_output(
         )
 
     return {
-        "instruction": str(action_context["task_instruction"]),
+        "caption": str(action_context["task_instruction"]),
         "frame_interval": [seg_start, seg_end],
         "atomic_actions": atomic_actions,
     }
+
+
+def _build_overall_instruction(tasks: list[dict[str, Any]]) -> str:
+    captions = [str(task.get("caption") or task.get("instruction") or "").strip() for task in tasks]
+    captions = [caption for caption in captions if caption]
+    if not captions:
+        return "perform the current task"
+    if len(captions) == 1:
+        return captions[0]
+    return "; ".join(captions)
 
 
 def segment(
@@ -831,9 +842,11 @@ def segment(
             fps=fps,
         )
 
+    tasks = [task for task in output_tasks if task is not None]
     return {
+        "instruction": _build_overall_instruction(tasks),
         "scene": scene,
-        "tasks": [task for task in output_tasks if task is not None],
+        "tasks": tasks,
     }
 
 
@@ -1014,7 +1027,9 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
         )
 
     log.info("[%s] Scene: %s", video_path.stem, scene)
+    tasks = [task for task in output_tasks if task is not None]
     return {
+        "instruction": _build_overall_instruction(tasks),
         "scene": scene,
-        "tasks": [task for task in output_tasks if task is not None],
+        "tasks": tasks,
     }

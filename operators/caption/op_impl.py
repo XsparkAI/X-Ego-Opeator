@@ -10,9 +10,20 @@ from pathlib import Path
 import cv2
 
 from ..operator_base import OperatorResult
+from ..segment_cut.op_impl import cut_caption_segments
 from ..video_path import resolve_episode_video_path
+from .vlm_api import get_api_key
 
 log = logging.getLogger(__name__)
+
+
+def _count_caption_actions(tasks: list[dict]) -> int:
+    return sum(len(task.get("atomic_actions", [])) for task in tasks)
+
+
+def _count_caption_segments(tasks: list[dict]) -> int:
+    actions = _count_caption_actions(tasks)
+    return actions if actions else len(tasks)
 
 
 @dataclass
@@ -33,6 +44,9 @@ class SegmentationConfig:
     action_window_sec: float = 6.0
     action_step_sec: float = 3.0
     action_frames_per_window: int = 8
+    segment_cut_enabled: bool = False
+    segment_cut_granularity: str = "task"
+    segment_cut_output_dir_name: str = "segments"
 
 
 class SegmentationOperator:
@@ -115,12 +129,13 @@ class SegmentationOperator:
 
             tasks = caption.get("tasks", [])
             metrics = {
-                "num_segments": sum(len(task.get("atomic_actions", [])) for task in tasks),
+                "num_segments": _count_caption_segments(tasks),
                 "num_tasks": len(tasks),
-                "num_actions": sum(len(task.get("atomic_actions", [])) for task in tasks),
+                "num_actions": _count_caption_actions(tasks),
                 "method": method,
             }
             output_files = [str(output_path)]
+            segment_metrics = None
 
             if preview_fn is not None:
                 try:
@@ -132,6 +147,21 @@ class SegmentationOperator:
                     log.info(f"Caption preview saved: {preview_path}")
                 except Exception as e:
                     log.warning(f"caption preview failed (non-fatal): {e}")
+
+            if self.config.segment_cut_enabled:
+                segment_result = cut_caption_segments(
+                    caption_path=output_path,
+                    video_path=video_path,
+                    output_dir=episode_dir / self.config.segment_cut_output_dir_name,
+                    granularity=self.config.segment_cut_granularity,
+                )
+                if segment_result.status != "ok":
+                    raise RuntimeError("; ".join(segment_result.errors) or "segment_cut failed")
+                output_files.extend(segment_result.output_files)
+                segment_metrics = segment_result.metrics
+
+            if segment_metrics is not None:
+                metrics["segment_cut"] = segment_metrics
 
             return OperatorResult(
                 status="ok", operator=self.name,
@@ -153,6 +183,14 @@ class SegmentationOperator:
             return OperatorResult(
                 status="error", operator=self.name,
                 errors=[f"Video not found: {video_path}"],
+            )
+        if not get_api_key():
+            return OperatorResult(
+                status="error", operator=self.name,
+                errors=[
+                    "VLM API key is not set. Configure VLM_API_KEY, DASHSCOPE_API_KEY, "
+                    "ARK_API_KEY, or vlm_api_key in pipeline_config.yaml."
+                ],
             )
 
         try:
@@ -224,14 +262,14 @@ class SegmentationOperator:
             )
 
             tasks = caption.get("tasks", [])
-            segments = sum(len(task.get("atomic_actions", [])) for task in tasks)
             metrics = {
-                "num_segments": segments,
+                "num_segments": _count_caption_segments(tasks),
                 "num_tasks": len(tasks),
-                "num_actions": sum(len(task.get("atomic_actions", [])) for task in tasks),
+                "num_actions": _count_caption_actions(tasks),
                 "method": method,
             }
             output_files = [str(output_path)]
+            segment_metrics = None
 
             # Preview generation is optional metadata output and should not fail the operator.
             if preview_fn is not None:
@@ -244,6 +282,21 @@ class SegmentationOperator:
                     log.info(f"Caption preview saved: {preview_path}")
                 except Exception as e:
                     log.warning(f"caption preview failed (non-fatal): {e}")
+
+            if self.config.segment_cut_enabled:
+                segment_result = cut_caption_segments(
+                    caption_path=output_path,
+                    video_path=video_path,
+                    output_dir=episode_dir / self.config.segment_cut_output_dir_name,
+                    granularity=self.config.segment_cut_granularity,
+                )
+                if segment_result.status != "ok":
+                    raise RuntimeError("; ".join(segment_result.errors) or "segment_cut failed")
+                output_files.extend(segment_result.output_files)
+                segment_metrics = segment_result.metrics
+
+            if segment_metrics is not None:
+                metrics["segment_cut"] = segment_metrics
 
             return OperatorResult(
                 status="ok", operator=self.name,

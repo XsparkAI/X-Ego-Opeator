@@ -14,6 +14,7 @@ BACKEND="${BACKEND:-${HAND_BACKEND:-yolo}}"
 CONF="${CONF:-0.3}"
 STEP="${STEP:-1}"
 RESIZE="${RESIZE:-720}"
+YOLO_BATCH_SIZE="${YOLO_BATCH_SIZE:-16}"
 PREVIEW="${PREVIEW:-false}"
 NO_BATCH="${NO_BATCH:-false}"
 MAX_WORKERS="${MAX_WORKERS:-4}"
@@ -48,7 +49,7 @@ esac
 set -- "$@" --backend "$BACKEND" --frame-step "$STEP"
 
 if [[ "$BACKEND" == "yolo" ]]; then
-  set -- "$@" --conf "$CONF" --resize "$RESIZE"
+  set -- "$@" --conf "$CONF" --resize "$RESIZE" --yolo-batch-size "$YOLO_BATCH_SIZE"
 fi
 
 if normalize_bool "$PREVIEW"; then

@@ -653,19 +653,14 @@ def segment(
     task_caption = task_name or (segments[0]["instruction"] if segments else "perform the current task")
 
     return {
+        "instruction": task_caption,
         "scene": scene,
         "tasks": [
             {
-                "instruction": task_caption,
-                "frame_interval": [0, nframes],
-                "atomic_actions": [
-                    {
-                        "frame_interval": seg["frame_interval"],
-                        "caption": seg["instruction"],
-                    }
-                    for seg in segments
-                ],
+                "caption": seg["instruction"],
+                "frame_interval": seg["frame_interval"],
             }
+            for seg in segments
         ],
     }
 
@@ -782,19 +777,14 @@ def collect_segment_job(state: dict, *, poll_interval_sec: int = 20) -> dict:
     log.info(f"[{video_path.stem}] Scene: {scene}")
 
     return {
+        "instruction": task_caption,
         "scene": scene,
         "tasks": [
             {
-                "instruction": task_caption,
-                "frame_interval": [0, nframes],
-                "atomic_actions": [
-                    {
-                        "frame_interval": seg["frame_interval"],
-                        "caption": seg["instruction"],
-                    }
-                    for seg in segments
-                ],
+                "caption": seg["instruction"],
+                "frame_interval": seg["frame_interval"],
             }
+            for seg in segments
         ],
     }
 
@@ -831,10 +821,9 @@ def process_video(video_path: Path, preview: bool = False, dry_run: bool = False
     print(f"\n{'─' * 60}")
     print(f"  {name}")
     print(f"  Scene: {caption.get('scene', 'unknown')}")
-    task = caption["tasks"][0]
-    print(f"  Task: {task['instruction']}")
-    print(f"  Segments: {len(task['atomic_actions'])}")
-    for i, a in enumerate(task["atomic_actions"]):
+    print(f"  Task: {caption.get('instruction', 'perform the current task')}")
+    print(f"  Segments: {len(caption.get('tasks', []))}")
+    for i, a in enumerate(caption.get("tasks", [])):
         s, e = a["frame_interval"]
         dur = (e - s) / fps
         print(f"    Step {i + 1}: [{s:>4d}, {e:>4d}] ({dur:5.1f}s) — {a['caption']}")
@@ -888,7 +877,11 @@ def generate_preview(video_path: Path, caption: dict, fps: float) -> Path:
     writer = cv2.VideoWriter(str(tmp_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (out_w, out_h))
 
     tasks = caption.get("tasks", [])
-    actions = tasks[0].get("atomic_actions", []) if tasks else []
+    actions = []
+    if tasks and tasks[0].get("atomic_actions"):
+        actions = tasks[0].get("atomic_actions", [])
+    else:
+        actions = tasks
 
     fidx = 0
     while True:

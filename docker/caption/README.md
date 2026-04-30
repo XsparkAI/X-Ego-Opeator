@@ -63,6 +63,59 @@ docker run --rm \
 
 In episode mode, the operator writes `caption.json` into the mounted episode directory unless `--output` is set explicitly.
 
+Optional caption-driven segment cutting:
+
+```bash
+docker run --rm \
+  -e DASHSCOPE_API_KEY=your_key \
+  -v "$(pwd)/tmp/test_episode_10s:/data" \
+  egox-caption-cpu \
+  --method atomic_action \
+  --episode /data \
+  --no-batch \
+  --segment-cut \
+  --segment-granularity atomic_action
+```
+
+When enabled, the runner first writes `caption.json`, then cuts clips from that
+caption into `segments/seg_*/rgb.mp4` and writes `segments/segments_manifest.json`.
+The segment cutter re-encodes at exact caption boundaries while preserving the
+source video's codec family, frame rate, pixel format, bitrate when available,
+and audio stream settings instead of forcing one fixed ffmpeg profile.
+
+## Caption JSON Schema
+
+`method=task` writes task-level segments without `atomic_actions`:
+
+```json
+{
+  "instruction": "wipe the table",
+  "scene": "kitchen",
+  "tasks": [
+    {"caption": "pick up the cloth", "frame_interval": [0, 120]},
+    {"caption": "wipe the table surface", "frame_interval": [120, 260]}
+  ]
+}
+```
+
+`method=atomic_action` writes task-level captions plus nested atomic actions:
+
+```json
+{
+  "instruction": "pick up the cloth; wipe the table surface",
+  "scene": "kitchen",
+  "tasks": [
+    {
+      "caption": "wipe the table surface",
+      "frame_interval": [120, 260],
+      "atomic_actions": [
+        {"caption": "move the cloth across the table", "frame_interval": [120, 180]}
+      ]
+    }
+  ]
+}
+```
+
 ## Run With Environment Variables
 
 `task` video mode:
@@ -90,6 +143,8 @@ docker run --rm \
   -e EPISODE_DIR=/data \
   -e EGOX_INPUT_VIDEO_PATH=rgb.mp4 \
   -e NO_BATCH=true \
+  -e SEGMENT_CUT=true \
+  -e SEGMENT_GRANULARITY=task \
   -e MAX_WORKERS=4 \
   -e TASK_WINDOW_SEC=12 \
   -e TASK_STEP_SEC=6 \
@@ -124,8 +179,17 @@ The output artifact follows the platform large-payload convention:
 - `artifact.data` contains only a small summary (`scene`, task/action counts, method, and `payloadPath`)
 - `artifact.dataRef.payloadPath` also points to the full caption JSON for downstream operators that prefer external payloads
 - `artifact.portId` is `out-1` and `artifact.portName` is `result`
+- when `segment_cut=true`, the same caption node also emits `out-2` / `segments`
+  as a JSON artifact pointing to `segments_manifest.json`; each manifest entry
+  points to the actual cut video and `segment_info.json`
+- each successfully cut clip is also emitted directly as a `video` artifact on
+  `out-3` / `segment_video`, so platform consumers do not need to parse the
+  manifest before seeing the clipped videos
 
 Recommended hyperparams:
+
+Platform hyperparams use one canonical snake_case name per behavior. The
+matching uppercase environment variable is only for Docker local/env mode.
 
 - `method`: `task` or `atomic_action`
 - `no_batch`; Docker platform mode defaults to direct requests (`no_batch=true`) for every provider
@@ -136,6 +200,8 @@ Recommended hyperparams:
 - `task_window_sec`, `task_step_sec`, `task_frames_per_window`
 - `action_window_sec`, `action_step_sec`, `action_frames_per_window`
 - `preview`
+- `segment_cut`: optional, defaults to `false`
+- `segment_granularity`: `task` or `atomic_action`, defaults to `task`; `atomic_action` requires caption JSON with nested `atomic_actions`
 - `vlm_api_provider`, `vlm_api_key`, `vlm_model`
 
 ## Cache And Path Conventions

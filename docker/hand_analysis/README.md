@@ -37,7 +37,8 @@ docker run --rm \
   --output /data/hand_analysis.json \
   --conf 0.3 \
   --frame-step 1 \
-  --resize 720
+  --resize 720 \
+  --yolo-batch-size 16
 ```
 
 Equivalent command for `tmp/test_episode_10s/rgb.mp4` from the repository root:
@@ -110,6 +111,7 @@ docker run --rm \
   -e CONF=0.3 \
   -e STEP=1 \
   -e RESIZE=720 \
+  -e YOLO_BATCH_SIZE=16 \
   -v "$(pwd)/test_video:/data" \
   egox-hand-cpu
 ```
@@ -125,6 +127,7 @@ docker run --rm \
   -e CONF=0.3 \
   -e STEP=1 \
   -e RESIZE=720 \
+  -e YOLO_BATCH_SIZE=16 \
   -v "$(pwd)/tmp/test_episode_10s:/data" \
   egox-hand-cpu
 ```
@@ -216,6 +219,7 @@ Current limitation:
 - the adapter writes both `credentials` and `config` for `bcecmd`, so non-default BOS domains can be resolved correctly
 - when only a BOS prefix is available, the adapter lists objects under that prefix and prefers `rgb.mp4`, then `cam_head.mp4`, then other video files
 - VLM model env/config now uses `VLM_MODEL`; old `VLM_HAND_MODEL` is still accepted as a compatibility alias
+- YOLO mode uses batched `predict` by default; tune with `YOLO_BATCH_SIZE` / `yolo_batch_size` (default `16`)
 - if no VLM model is specified, the provider-specific fallback is `qwen3.5-flash` for `dashscope` and `doubao-seed-2-0-lite-260215` for `volcengine_ark`
 - VLM platform mode defaults to direct requests (`no_batch=true`) for every provider; set `no_batch=false` explicitly only when the provider supports async batch submission and the workflow should wait for batch completion
 

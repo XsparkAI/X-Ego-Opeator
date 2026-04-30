@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Privacy blur operator using EgoBlur Gen2.
 
@@ -13,6 +15,7 @@ Usage:
 """
 
 import argparse
+from contextlib import nullcontext
 from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import logging
@@ -35,16 +38,27 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     from video_path import resolve_episode_video_path
 
-from ego_blur import ClassID, EgoblurDetector
-from gen2.script.constants import (
-    FACE_THRESHOLDS_GEN2,
-    LP_THRESHOLDS_GEN2,
-    RESIZE_MIN_GEN2,
-    RESIZE_MAX_GEN2,
-)
-from gen2.script.predictor import PATCH_INSTANCES_FIELDS
-from gen2.script.detectron2.export.torchscript_patch import patch_instances
-from gen2.script.detectron2.utils.utils import ResizeShortestEdge
+try:
+    from ego_blur import ClassID, EgoblurDetector
+    from gen2.script.constants import (
+        FACE_THRESHOLDS_GEN2,
+        LP_THRESHOLDS_GEN2,
+        RESIZE_MIN_GEN2,
+        RESIZE_MAX_GEN2,
+    )
+    from gen2.script.predictor import PATCH_INSTANCES_FIELDS
+    from gen2.script.detectron2.export.torchscript_patch import patch_instances
+    from gen2.script.detectron2.utils.utils import ResizeShortestEdge
+except ImportError:
+    ClassID = None
+    EgoblurDetector = None
+    FACE_THRESHOLDS_GEN2 = {}
+    LP_THRESHOLDS_GEN2 = {}
+    RESIZE_MIN_GEN2 = 0
+    RESIZE_MAX_GEN2 = 0
+    PATCH_INSTANCES_FIELDS = None
+    patch_instances = None
+    ResizeShortestEdge = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -86,6 +100,8 @@ def _get_device() -> str:
 
 def _compute_egoblur_target(orig_h: int, orig_w: int) -> tuple[int, int]:
     """Compute the exact (H, W) that EgoBlur's internal ResizeShortestEdge would produce."""
+    if ResizeShortestEdge is None:
+        raise RuntimeError("EgoBlur backend is unavailable because ego_blur is not installed")
     return ResizeShortestEdge.get_output_shape(
         orig_h, orig_w, RESIZE_MIN_GEN2, RESIZE_MAX_GEN2,
     )
@@ -105,6 +121,9 @@ def _build_detectors(
     externally resize frames to the exact EgoBlur target resolution,
     bypassing the expensive numpy-based internal resize.
     """
+    if EgoblurDetector is None or ClassID is None:
+        raise RuntimeError("EgoBlur backend is unavailable because ego_blur is not installed")
+
     face_det = None
     lp_det = None
 
@@ -578,7 +597,7 @@ def blur_video(
     blur_targets: str = "both",
     detection_mode: str = "sampling_expand",
     frame_sampling_step: int = 1,
-    use_frame_cache: bool = False,
+    use_frame_cache: bool = True,
     frame_cache_num_workers: int = 1,
     face: bool = True,
     lp: bool = True,
@@ -891,7 +910,12 @@ def blur_video(
             cap_detect.release()
             raise RuntimeError(f"Cannot open video for random-access scan: {video_path}")
 
-    with torch.no_grad(), patch_instances(fields=PATCH_INSTANCES_FIELDS):
+    patch_context = (
+        patch_instances(fields=PATCH_INSTANCES_FIELDS)
+        if patch_instances is not None and PATCH_INSTANCES_FIELDS is not None
+        else nullcontext()
+    )
+    with torch.no_grad(), patch_context:
         if detection_mode == "legacy_per_frame":
             prefetch_width = max(4, frame_cache_worker_count * 2)
             write_pass_started = time.time()

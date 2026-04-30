@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import subprocess
 import tempfile
@@ -80,7 +81,7 @@ class PrivacyBlurConfig:
     blur_targets: str = "both"  # "face" | "lp" | "both"
     detection_mode: str = "sampling_expand"  # "sampling_expand" | "legacy_per_frame"
     frame_sampling_step: int = 1
-    use_frame_cache: bool = False
+    use_frame_cache: bool = True
     frame_cache_num_workers: int = 1
     face: bool = True
     lp: bool = True

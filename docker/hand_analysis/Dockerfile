@@ -29,6 +29,7 @@ COPY operators /app/operators
 COPY weights/detector.pt /app/weights/detector.pt
 COPY operators/video_path.py /app/video_path.py
 COPY docker/hand_analysis/bcecmd /app/bcecmd
+COPY docker/platform_input.py /app/platform_input.py
 COPY docker/hand_analysis/entrypoint.sh /app/entrypoint.sh
 COPY docker/hand_analysis/platform_runner.py /app/platform_runner.py
 COPY docker/hand_analysis/runner.py /app/runner.py

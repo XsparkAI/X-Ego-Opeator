@@ -16,6 +16,7 @@ for candidate in (SCRIPT_DIR, SCRIPT_DIR.parent, SCRIPT_DIR.parent.parent):
 from operators.caption.segment_v2t import generate_preview, segment as run_segment_v2t
 from operators.caption.task_action_v2t import segment as run_task_action_v2t
 from operators.caption.vlm_api import get_api_key
+from operators.segment_cut.op_impl import cut_caption_segments
 from operators.video_path import resolve_episode_video_path
 
 
@@ -27,7 +28,7 @@ def _bool_from_env(name: str, default: bool = False) -> bool:
 
 
 def _default_method() -> str:
-    return _normalize_method(os.getenv("METHOD", os.getenv("CAPTION_METHOD", "task")))
+    return _normalize_method(os.getenv("METHOD", "task"))
 
 
 def _normalize_method(method: str | None) -> str:
@@ -73,6 +74,7 @@ def _caption_summary(method: str, caption: dict, preview_path: Path | None = Non
     actions = sum(len(task.get("atomic_actions", [])) for task in tasks if isinstance(task, dict))
     return {
         "method": method,
+        "instruction": caption.get("instruction", "") if isinstance(caption, dict) else "",
         "scene": caption.get("scene", "unknown") if isinstance(caption, dict) else "unknown",
         "numTasks": len(tasks),
         "numActions": actions,
@@ -95,7 +97,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--preview", action="store_true", default=_bool_from_env("PREVIEW"))
     parser.add_argument("--max-workers", type=int, default=int(os.getenv("MAX_WORKERS", "8")))
     parser.add_argument("--no-batch", action="store_true", default=_bool_from_env("NO_BATCH"))
-
+    parser.add_argument("--segment-cut", action="store_true", default=_bool_from_env("SEGMENT_CUT"))
+    parser.add_argument(
+        "--segment-granularity",
+        choices=["task", "atomic_action"],
+        default=os.getenv("SEGMENT_GRANULARITY", "task"),
+    )
+    parser.add_argument(
+        "--segment-output-dir",
+        type=Path,
+        default=Path(os.getenv("SEGMENT_OUTPUT_DIR")) if os.getenv("SEGMENT_OUTPUT_DIR") else None,
+    )
     parser.add_argument("--window-sec", type=float, default=float(os.getenv("WINDOW_SEC", "10.0")))
     parser.add_argument("--step-sec", type=float, default=float(os.getenv("STEP_SEC", "5.0")))
     parser.add_argument("--frames-per-window", type=int, default=int(os.getenv("FRAMES_PER_WINDOW", "12")))
@@ -114,10 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ark-api-key", default=os.getenv("ARK_API_KEY", ""))
     parser.add_argument(
         "--vlm-model",
-        default=os.getenv(
-            "VLM_MODEL",
-            os.getenv("VLM_CAPTION_MODEL", os.getenv("VLM_DEFAULT_MODEL", "")),
-        ),
+        default=os.getenv("VLM_MODEL", ""),
     )
     return parser
 
@@ -171,12 +180,24 @@ def run_caption(args: argparse.Namespace) -> dict:
             preview_path = generate_preview(video_path, caption, fps)
 
     output_path.write_text(json.dumps(caption, indent=2, ensure_ascii=False), encoding="utf-8")
+    segment_result = None
+    if args.segment_cut:
+        segment_output_dir = args.segment_output_dir or output_path.parent / "segments"
+        segment_result = cut_caption_segments(
+            caption_path=output_path,
+            video_path=video_path,
+            output_dir=segment_output_dir,
+            granularity=args.segment_granularity,
+        )
+        if segment_result.status != "ok":
+            raise RuntimeError("; ".join(segment_result.errors) or "segment_cut failed")
 
     return {
         "method": method,
         "video_path": video_path,
         "output_path": output_path,
         "preview_path": preview_path,
+        "segment_result": segment_result,
         "result": caption,
         "summary": _caption_summary(method, caption, preview_path=preview_path),
     }

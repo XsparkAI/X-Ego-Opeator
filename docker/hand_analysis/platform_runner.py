@@ -15,6 +15,7 @@ try:
     from runner import run_hand_analysis
 except ImportError:
     run_hand_analysis = None
+from platform_input import resolve_local_video_inputs
 
 JSON_SUFFIXES = {".json"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -633,6 +634,10 @@ def _build_args(kind: str, input_path: Path, output_path: Path, hyperparams: dic
         ),
         conf=_as_float(_pick_runtime_value(hyperparams, "CONF", "conf_thresh"), 0.3),
         resize=_as_int(_pick_runtime_value(hyperparams, "RESIZE", "input_height"), 720),
+        yolo_batch_size=_as_int(
+            _pick_runtime_value(hyperparams, "YOLO_BATCH_SIZE", "yolo_batch_size"),
+            16,
+        ),
         preview=_as_bool(_pick_runtime_value(hyperparams, "PREVIEW", "preview"), default=False),
         max_workers=_as_int(_pick_runtime_value(hyperparams, "MAX_WORKERS", "max_workers"), 4),
         no_batch=no_batch,
@@ -685,141 +690,14 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _unique_paths(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for path in paths:
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
-
-
-def _drop_parent_videos_when_child_inputs_exist(paths: list[Path]) -> list[Path]:
-    resolved = [(path, path.resolve()) for path in paths]
-    filtered: list[Path] = []
-    for path, real_path in resolved:
-        if path.name in DIRECT_VIDEO_NAMES and any(
-            other != real_path and real_path.parent in other.parents
-            for _, other in resolved
-        ):
-            continue
-        filtered.append(path)
-    return filtered
-
-
-def _direct_video_files(directory: Path) -> list[Path]:
-    configured_name = os.getenv("EGOX_INPUT_VIDEO_PATH", "rgb.mp4")
-    for name in (configured_name, *DIRECT_VIDEO_NAMES):
-        candidate = directory / name
-        if candidate.is_file():
-            return [candidate]
-    return sorted(path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES)
-
-
-def _collect_video_paths_from_dir(
-    directory: Path,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    real_dir = directory.resolve()
-    if real_dir in visited_dirs:
-        return []
-    visited_dirs.add(real_dir)
-
-    direct_videos = _direct_video_files(real_dir)
-    if direct_videos:
-        return direct_videos
-
-    child_videos: list[Path] = []
-    for child in sorted(path for path in real_dir.iterdir() if path.is_dir() and not path.name.startswith(".")):
-        child_videos.extend(_direct_video_files(child))
-    if child_videos:
-        return _unique_paths(child_videos)
-
-    collected: list[Path] = []
-    json_candidates = sorted(path for path in real_dir.iterdir() if path.is_file() and path.suffix.lower() == ".json")
-    for child in sorted(path for path in real_dir.iterdir() if path.is_dir() and not path.name.startswith(".")):
-        json_candidates.extend(sorted(path for path in child.iterdir() if path.is_file() and path.suffix.lower() == ".json"))
-    for json_path in json_candidates[:500]:
-        collected.extend(_collect_video_paths_from_path(json_path, real_dir, visited_json_files, visited_dirs))
-    return _unique_paths(collected)
-
-
-def _collect_video_paths_from_path(
-    candidate: str | Path,
-    base_dir: Path | None,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    path = _resolve_candidate_path(candidate, base_dir)
-    if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
-        return [path]
-    if path.is_file() and path.suffix.lower() == ".json":
-        real_path = path.resolve()
-        if real_path in visited_json_files:
-            return []
-        visited_json_files.add(real_path)
-        return _collect_video_paths_from_payload(_read_json_file(real_path), real_path.parent, visited_json_files, visited_dirs)
-    if path.is_dir():
-        return _collect_video_paths_from_dir(path, visited_json_files, visited_dirs)
-    return []
-
-
-def _collect_video_paths_from_payload(
-    payload: object,
-    base_dir: Path | None,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    if isinstance(payload, str):
-        if payload.startswith("bos://"):
-            return []
-        return _collect_video_paths_from_path(payload, base_dir, visited_json_files, visited_dirs)
-    if isinstance(payload, list):
-        collected: list[Path] = []
-        for item in payload:
-            collected.extend(_collect_video_paths_from_payload(item, base_dir, visited_json_files, visited_dirs))
-        return _unique_paths(collected)
-    if not isinstance(payload, dict):
-        return []
-
-    for key in ("clips", "clipPaths", "clip_paths", "videos", "videoPaths", "video_paths", "files", "items", "entries", "artifacts", "segments", "segment_dirs"):
-        if key in payload:
-            collected = _collect_video_paths_from_payload(payload[key], base_dir, visited_json_files, visited_dirs)
-            if collected:
-                return _unique_paths(collected)
-
-    for key in ("clipPath", "clip_path", *VIDEO_KEYS, "payloadPath", "manifestPath", "partitionDir", "rootPath", "root_path"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            collected = _collect_video_paths_from_payload(value, base_dir, visited_json_files, visited_dirs)
-            if collected:
-                return _unique_paths(collected)
-
-    collected: list[Path] = []
-    for value in payload.values():
-        collected.extend(_collect_video_paths_from_payload(value, base_dir, visited_json_files, visited_dirs))
-    return _unique_paths(collected)
-
-
 def _resolve_platform_video_inputs(artifact: dict, hyperparams: dict) -> list[tuple[str, Path]]:
-    collected: list[Path] = []
-    visited_json_files: set[Path] = set()
-    visited_dirs: set[Path] = set()
-    artifact_path = artifact.get("path")
-    if isinstance(artifact_path, str) and artifact_path and not artifact_path.startswith("bos://"):
-        collected.extend(_collect_video_paths_from_path(artifact_path, None, visited_json_files, visited_dirs))
-    artifact_data = artifact.get("data")
-    collected.extend(_collect_video_paths_from_payload(artifact_data, None, visited_json_files, visited_dirs))
-    for data_ref in (artifact.get("dataRef"), artifact_data.get("dataRef") if isinstance(artifact_data, dict) else None):
-        if isinstance(data_ref, dict):
-            for key in ("payloadPath", "manifestPath", "partitionDir"):
-                value = data_ref.get(key)
-                if isinstance(value, str) and value and not value.startswith("bos://"):
-                    collected.extend(_collect_video_paths_from_path(value, None, visited_json_files, visited_dirs))
-    videos = _drop_parent_videos_when_child_inputs_exist(_unique_paths(collected))
+    videos = resolve_local_video_inputs(
+        artifact,
+        read_json_file=_read_json_file,
+        video_keys=VIDEO_KEYS,
+        video_suffixes=VIDEO_SUFFIXES,
+        direct_video_names=DIRECT_VIDEO_NAMES,
+    )
     if videos:
         return [("video", path) for path in videos]
     return [_resolve_runtime_input(artifact, hyperparams)]
@@ -836,6 +714,7 @@ def _log_runtime_args(args: argparse.Namespace) -> None:
         "[egox] resolved runtime args "
         f"backend={args.backend} "
         f"frame_step={args.frame_step} "
+        f"yolo_batch_size={args.yolo_batch_size} "
         f"no_batch={args.no_batch} "
         f"max_workers={args.max_workers} "
         f"vlm_provider={args.vlm_provider or '<empty>'} "
@@ -849,6 +728,7 @@ def _runtime_args_summary(args: argparse.Namespace) -> dict:
     return {
         "backend": args.backend,
         "frameStep": args.frame_step,
+        "yoloBatchSize": args.yolo_batch_size,
         "noBatch": args.no_batch,
         "maxWorkers": args.max_workers,
         "vlmProvider": args.vlm_provider or None,
@@ -934,6 +814,7 @@ def main() -> None:
                     "hand_analysis resolved runtime args: "
                     f"backend={first_args.backend if first_args else '<empty>'}, "
                     f"frame_step={first_args.frame_step if first_args else '<empty>'}, "
+                    f"yolo_batch_size={first_args.yolo_batch_size if first_args else '<empty>'}, "
                     f"no_batch={first_args.no_batch if first_args else '<empty>'}, "
                     f"max_workers={first_args.max_workers if first_args else '<empty>'}, "
                     f"vlm_provider={(first_args.vlm_provider or '<empty>') if first_args else '<empty>'}, "

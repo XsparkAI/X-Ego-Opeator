@@ -55,6 +55,7 @@ def detect_hands_in_video(
     frame_step: int = 1,
     weights: Path = WEIGHTS_PATH,
     input_height: int | None = 720,
+    batch_size: int = 16,
     model: YOLO | None = None,
 ) -> dict:
     """
@@ -96,8 +97,66 @@ def detect_hands_in_video(
     frame_results = []
     frame_idx = 0
     t_start = time.time()
+    effective_batch_size = max(1, int(batch_size))
+
+    def append_prediction_result(source_frame_idx: int, boxes_result) -> None:
+        left_detections = []
+        right_detections = []
+
+        if boxes_result is not None and len(boxes_result) > 0:
+            xyxy = boxes_result.xyxy.cpu().numpy()
+            confs = boxes_result.conf.cpu().numpy()
+            classes = boxes_result.cls.cpu().numpy()
+
+            # Deduplicate: keep at most one left and one right (highest conf).
+            left_best_conf = -1
+            right_best_conf = -1
+
+            for i in range(len(xyxy)):
+                x1, y1, x2, y2 = [v * scale_back for v in xyxy[i].tolist()]
+                conf = float(confs[i])
+                hand_cls = int(classes[i])
+                hand_side = "left" if hand_cls == 0 else "right"
+
+                det = {
+                    "bbox_xyxy": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
+                    "conf": round(conf, 4),
+                    "track_id": None,
+                }
+
+                if hand_side == "left" and conf > left_best_conf:
+                    left_detections = [det]
+                    left_best_conf = conf
+                elif hand_side == "right" and conf > right_best_conf:
+                    right_detections = [det]
+                    right_best_conf = conf
+
+        frame_results.append({
+            "frame": source_frame_idx,
+            "time_sec": round(source_frame_idx / fps, 4) if fps > 0 else None,
+            "left_hand": left_detections[0] if left_detections else None,
+            "right_hand": right_detections[0] if right_detections else None,
+            "has_left": len(left_detections) > 0,
+            "has_right": len(right_detections) > 0,
+            "has_any_hand": len(left_detections) > 0 or len(right_detections) > 0,
+        })
+
+    def flush_batch(batch_frames: list[np.ndarray], batch_indices: list[int]) -> None:
+        if not batch_frames:
+            return
+        results = model.predict(
+            batch_frames,
+            conf=conf_thresh,
+            batch=len(batch_frames),
+            verbose=False,
+            stream=True,
+        )
+        for source_frame_idx, result in zip(batch_indices, results):
+            append_prediction_result(source_frame_idx, result.boxes)
 
     with torch.no_grad():
+        batch_frames: list[np.ndarray] = []
+        batch_indices: list[int] = []
         while True:
             ret, frame_bgr = cap.read()
             if not ret:
@@ -112,57 +171,15 @@ def detect_hands_in_video(
             else:
                 det_frame = frame_bgr
 
-            results = model.track(det_frame, conf=conf_thresh, persist=True, verbose=False)
-            boxes_result = results[0].boxes
-
-            left_detections = []
-            right_detections = []
-
-            if boxes_result is not None and len(boxes_result) > 0:
-                xyxy = boxes_result.xyxy.cpu().numpy()
-                confs = boxes_result.conf.cpu().numpy()
-                classes = boxes_result.cls.cpu().numpy()
-                track_ids = (
-                    boxes_result.id.cpu().numpy()
-                    if boxes_result.id is not None
-                    else [-1] * len(xyxy)
-                )
-
-                # Deduplicate: keep at most one left and one right (highest conf)
-                left_best_conf = -1
-                right_best_conf = -1
-
-                for i in range(len(xyxy)):
-                    x1, y1, x2, y2 = [v * scale_back for v in xyxy[i].tolist()]
-                    conf = float(confs[i])
-                    hand_cls = int(classes[i])
-                    track_id = int(track_ids[i]) if track_ids[i] != -1 else None
-                    hand_side = "left" if hand_cls == 0 else "right"
-
-                    det = {
-                        "bbox_xyxy": [round(x1, 1), round(y1, 1), round(x2, 1), round(y2, 1)],
-                        "conf": round(conf, 4),
-                        "track_id": track_id,
-                    }
-
-                    if hand_side == "left" and conf > left_best_conf:
-                        left_detections = [det]
-                        left_best_conf = conf
-                    elif hand_side == "right" and conf > right_best_conf:
-                        right_detections = [det]
-                        right_best_conf = conf
-
-            frame_results.append({
-                "frame": frame_idx,
-                "time_sec": round(frame_idx / fps, 4) if fps > 0 else None,
-                "left_hand": left_detections[0] if left_detections else None,
-                "right_hand": right_detections[0] if right_detections else None,
-                "has_left": len(left_detections) > 0,
-                "has_right": len(right_detections) > 0,
-                "has_any_hand": len(left_detections) > 0 or len(right_detections) > 0,
-            })
+            batch_frames.append(det_frame)
+            batch_indices.append(frame_idx)
+            if len(batch_frames) >= effective_batch_size:
+                flush_batch(batch_frames, batch_indices)
+                batch_frames.clear()
+                batch_indices.clear()
 
             frame_idx += 1
+        flush_batch(batch_frames, batch_indices)
 
     cap.release()
     elapsed = time.time() - t_start
@@ -184,6 +201,7 @@ def detect_hands_in_video(
         "original_resolution": f"{orig_w}x{orig_h}",
         "detection_resolution": f"{det_w}x{det_h}",
         "frame_step": frame_step,
+        "batch_size": effective_batch_size,
         "conf_thresh": conf_thresh,
         "elapsed_sec": round(elapsed, 3),
         "fps_throughput": round(n / elapsed, 2) if elapsed > 0 else 0,
@@ -283,7 +301,12 @@ def generate_preview(
     log.info(f"Preview saved to {output_path} ({preview_w}x{preview_height})")
 
 
-def process_episode(episode_dir: Path, conf_thresh: float = 0.3, frame_step: int = 1) -> Path:
+def process_episode(
+    episode_dir: Path,
+    conf_thresh: float = 0.3,
+    frame_step: int = 1,
+    batch_size: int = 16,
+) -> Path:
     """Process a single episode directory (reads configured input video, writes hand_analysis.json)."""
     video_path = resolve_episode_video_path(episode_dir)
     output_path = episode_dir / "hand_analysis.json"
@@ -291,7 +314,12 @@ def process_episode(episode_dir: Path, conf_thresh: float = 0.3, frame_step: int
     if not video_path.exists():
         raise FileNotFoundError(f"Video not found: {video_path}")
 
-    result = detect_hands_in_video(video_path, conf_thresh=conf_thresh, frame_step=frame_step)
+    result = detect_hands_in_video(
+        video_path,
+        conf_thresh=conf_thresh,
+        frame_step=frame_step,
+        batch_size=batch_size,
+    )
 
     with open(output_path, "w") as f:
         json.dump(result, f, indent=2)
@@ -308,15 +336,25 @@ def main():
     parser.add_argument("--output", type=Path, default=None, help="Output JSON path (--video mode only)")
     parser.add_argument("--conf", type=float, default=0.3, help="YOLO confidence threshold (default: 0.3)")
     parser.add_argument("--step", type=int, default=1, help="Process every N-th frame (default: 1)")
+    parser.add_argument("--batch-size", type=int, default=16, help="YOLO predict batch size (default: 16)")
     parser.add_argument("--preview", action="store_true", help="Generate preview video with detection boxes")
     parser.add_argument("--resize", type=int, default=720, help="Resize input to this height before detection (default: 720)")
     args = parser.parse_args()
 
     if args.episode:
-        process_episode(args.episode, conf_thresh=args.conf, frame_step=args.step)
+        process_episode(
+            args.episode,
+            conf_thresh=args.conf,
+            frame_step=args.step,
+            batch_size=args.batch_size,
+        )
     else:
         result = detect_hands_in_video(
-            args.video, conf_thresh=args.conf, frame_step=args.step, input_height=args.resize,
+            args.video,
+            conf_thresh=args.conf,
+            frame_step=args.step,
+            input_height=args.resize,
+            batch_size=args.batch_size,
         )
         out = args.output or args.video.with_name("hand_analysis.json")
         with open(out, "w") as f:

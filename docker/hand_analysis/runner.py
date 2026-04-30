@@ -85,6 +85,7 @@ def _normalize_yolo_result(result: dict) -> dict:
             "sampledFrames": sampled_frames,
             "validFrames": valid_frames,
             "failedFrames": 0,
+            "batchSize": summary.get("batch_size"),
             "avgEgoHandCount": avg_ego_hand_count,
             "framesWithAtLeastOneHand": at_least_one_hand,
             "atLeastOneHandRatio": summary.get("at_least_one_hand_ratio", summary.get("any_hand_ratio")),
@@ -159,6 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--frame-step", type=int, default=int(os.getenv("FRAME_STEP", os.getenv("STEP", "1"))))
     parser.add_argument("--conf", type=float, default=float(os.getenv("CONF", "0.3")))
     parser.add_argument("--resize", type=int, default=int(os.getenv("RESIZE", "720")))
+    parser.add_argument("--yolo-batch-size", type=int, default=int(os.getenv("YOLO_BATCH_SIZE", "16")))
     parser.add_argument("--preview", action="store_true", default=_bool_from_env("PREVIEW"))
 
     parser.add_argument("--max-workers", type=int, default=int(os.getenv("MAX_WORKERS", "4")))
@@ -177,6 +179,7 @@ def run_yolo(args: argparse.Namespace, video_path: Path, output_path: Path) -> d
         conf_thresh=args.conf,
         frame_step=args.frame_step,
         input_height=args.resize,
+        batch_size=args.yolo_batch_size,
     )
     result = _normalize_hand_analysis_result("yolo", raw_result)
     output_path.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")

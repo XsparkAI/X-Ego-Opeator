@@ -31,6 +31,7 @@ COPY weights/yolo26s_face.pt /app/weights/yolo26s_face.pt
 COPY weights/yolo_lp.pt /app/weights/yolo_lp.pt
 COPY operators/video_path.py /app/video_path.py
 COPY docker/hand_analysis/bcecmd /app/bcecmd
+COPY docker/platform_input.py /app/platform_input.py
 COPY docker/hand_analysis/platform_runner.py /app/hand_platform_helpers.py
 COPY docker/privacy_blur/entrypoint.sh /app/entrypoint.sh
 COPY docker/privacy_blur/platform_runner.py /app/platform_runner.py

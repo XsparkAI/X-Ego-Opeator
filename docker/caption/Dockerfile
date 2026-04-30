@@ -3,7 +3,7 @@ FROM python:3.10-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    CAPTION_DOCKER_VERSION=20260427-test-09
+    CAPTION_DOCKER_VERSION=20260429-segment-cut
 
 WORKDIR /app
 
@@ -26,6 +26,7 @@ RUN pip install --upgrade pip setuptools wheel && \
 
 COPY operators /app/operators
 COPY docker/hand_analysis/bcecmd /app/bcecmd
+COPY docker/platform_input.py /app/platform_input.py
 COPY docker/caption/entrypoint.sh /app/entrypoint.sh
 COPY docker/caption/platform_runner.py /app/platform_runner.py
 COPY docker/caption/runner.py /app/runner.py

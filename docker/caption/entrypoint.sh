@@ -10,10 +10,11 @@ if [[ -n "${INPUT_ARTIFACTS_PATH:-}" && -n "${RESULT_OUTPUT_PATH:-}" && -n "${ST
 fi
 
 MODE="${MODE:-video}"
-METHOD="${METHOD:-${CAPTION_METHOD:-task}}"
+METHOD="${METHOD:-task}"
 PREVIEW="${PREVIEW:-false}"
-NO_BATCH="${NO_BATCH:-}"
-BATCH_ENABLED="${BATCH_ENABLED:-false}"
+SEGMENT_CUT="${SEGMENT_CUT:-false}"
+SEGMENT_GRANULARITY="${SEGMENT_GRANULARITY:-task}"
+NO_BATCH="${NO_BATCH:-false}"
 MAX_WORKERS="${MAX_WORKERS:-8}"
 
 WINDOW_SEC="${WINDOW_SEC:-10.0}"
@@ -61,14 +62,17 @@ if normalize_bool "$PREVIEW"; then
   set -- "$@" --preview
 fi
 
-if [[ -n "$NO_BATCH" ]]; then
-  if normalize_bool "$NO_BATCH"; then
-    set -- "$@" --no-batch
+if normalize_bool "$SEGMENT_CUT"; then
+  set -- "$@" \
+    --segment-cut \
+    --segment-granularity "$SEGMENT_GRANULARITY"
+  if [[ -n "${SEGMENT_OUTPUT_DIR:-}" ]]; then
+    set -- "$@" --segment-output-dir "$SEGMENT_OUTPUT_DIR"
   fi
-elif [[ -n "$BATCH_ENABLED" ]]; then
-  if ! normalize_bool "$BATCH_ENABLED"; then
-    set -- "$@" --no-batch
-  fi
+fi
+
+if normalize_bool "$NO_BATCH"; then
+  set -- "$@" --no-batch
 fi
 
 if [[ -n "${VLM_API_PROVIDER:-}" ]]; then
@@ -85,10 +89,6 @@ if [[ -n "${ARK_API_KEY:-}" ]]; then
 fi
 if [[ -n "${VLM_MODEL:-}" ]]; then
   set -- "$@" --vlm-model "$VLM_MODEL"
-elif [[ -n "${VLM_CAPTION_MODEL:-}" ]]; then
-  set -- "$@" --vlm-model "$VLM_CAPTION_MODEL"
-elif [[ -n "${VLM_DEFAULT_MODEL:-}" ]]; then
-  set -- "$@" --vlm-model "$VLM_DEFAULT_MODEL"
 fi
 
 case "$METHOD" in

@@ -207,6 +207,7 @@ class HandAnalysisConfig:
     conf_thresh: float = 0.3       # YOLO detection confidence threshold
     input_height: int = 720        # resize height before detection
     yolo_frame_step: int = 1       # process every N-th frame in YOLO mode
+    yolo_batch_size: int = 16      # YOLO predict batch size
     vlm_sample_frame_step: int = 120  # shared sampling step for VLM hand/person/activity labels
     max_workers: int = 4           # kept only for compatibility with older VLM configs
     batch_enabled: bool = True     # whether VLM mode submits one batch job or sends per-frame requests
@@ -247,6 +248,7 @@ class HandAnalysisOperator:
             conf_thresh=self.config.conf_thresh,
             frame_step=self.config.yolo_frame_step,
             input_height=self.config.input_height,
+            batch_size=self.config.yolo_batch_size,
             model=self._yolo_model,
         )
         output_path.write_text(

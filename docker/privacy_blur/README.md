@@ -131,7 +131,7 @@ Platform hyperparameters include:
 - `scale`
 - `blur_targets`: `face` (default), `lp`, or `both`
 - `face_thresh`, `lp_thresh`
-- `use_frame_cache`, `frame_cache_num_workers`
+- `use_frame_cache`: default `true`, `frame_cache_num_workers`
 - `yolo_face_model_path`, `yolo_lp_model_path`, `yolo_conf_thresh`, `yolo_input_size`
 - `output_name`
 

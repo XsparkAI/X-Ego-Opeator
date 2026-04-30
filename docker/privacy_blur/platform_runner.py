@@ -9,6 +9,7 @@ from pathlib import Path
 import sys
 
 from runner import run_privacy_blur
+from platform_input import resolve_local_video_inputs
 
 
 def _load_hand_helpers():
@@ -41,161 +42,14 @@ def _output_name(default_name: str, hyperparams: dict) -> str:
     return output_name if Path(output_name).suffix else f"{output_name}.mp4"
 
 
-def _unique_paths(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for path in paths:
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
-
-
-def _drop_parent_videos_when_child_inputs_exist(paths: list[Path]) -> list[Path]:
-    direct_names = getattr(helpers, "DIRECT_VIDEO_NAMES", ("rgb.mp4", "cam_head.mp4", "video.mp4"))
-    resolved = [(path, path.resolve()) for path in paths]
-    filtered: list[Path] = []
-    for path, real_path in resolved:
-        if path.name in direct_names and any(
-            other != real_path and real_path.parent in other.parents
-            for _, other in resolved
-        ):
-            continue
-        filtered.append(path)
-    return filtered
-
-
-def _direct_video_files(directory: Path) -> list[Path]:
-    direct_names = getattr(helpers, "DIRECT_VIDEO_NAMES", ("rgb.mp4", "cam_head.mp4", "video.mp4"))
-    configured_name = os.getenv("EGOX_INPUT_VIDEO_PATH", "rgb.mp4")
-    for name in (configured_name, *direct_names):
-        candidate = directory / name
-        if candidate.is_file():
-            return [candidate]
-    return sorted(path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES)
-
-
-def _collect_video_paths_from_dir(
-    directory: Path,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    real_dir = directory.resolve()
-    if real_dir in visited_dirs:
-        return []
-    visited_dirs.add(real_dir)
-
-    direct_videos = _direct_video_files(real_dir)
-    if direct_videos:
-        return direct_videos
-
-    child_videos: list[Path] = []
-    for child in sorted(path for path in real_dir.iterdir() if path.is_dir() and not path.name.startswith(".")):
-        child_videos.extend(_direct_video_files(child))
-    if child_videos:
-        return _unique_paths(child_videos)
-
-    collected: list[Path] = []
-    json_files = sorted(path for path in real_dir.iterdir() if path.is_file() and path.suffix.lower() == ".json")
-    for child in sorted(path for path in real_dir.iterdir() if path.is_dir() and not path.name.startswith(".")):
-        json_files.extend(sorted(path for path in child.iterdir() if path.is_file() and path.suffix.lower() == ".json"))
-    for json_path in json_files[:500]:
-        collected.extend(_collect_video_paths_from_path(json_path, real_dir, visited_json_files, visited_dirs))
-    return _unique_paths(collected)
-
-
-def _resolve_local_path(candidate: str | Path, base_dir: Path | None = None) -> Path:
-    path = Path(candidate)
-    if path.is_absolute() or base_dir is None:
-        return path
-    return (base_dir / path).resolve()
-
-
-def _collect_video_paths_from_path(
-    candidate: str | Path,
-    base_dir: Path | None,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    path = _resolve_local_path(candidate, base_dir)
-    if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
-        return [path]
-    if path.is_file() and path.suffix.lower() == ".json":
-        real_path = path.resolve()
-        if real_path in visited_json_files:
-            return []
-        visited_json_files.add(real_path)
-        return _collect_video_paths_from_payload(
-            helpers._read_json_file(real_path),
-            real_path.parent,
-            visited_json_files,
-            visited_dirs,
-        )
-    if path.is_dir():
-        return _collect_video_paths_from_dir(path, visited_json_files, visited_dirs)
-    return []
-
-
-def _collect_video_paths_from_payload(
-    payload: object,
-    base_dir: Path | None,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    if isinstance(payload, str):
-        if payload.startswith("bos://"):
-            return []
-        return _collect_video_paths_from_path(payload, base_dir, visited_json_files, visited_dirs)
-
-    if isinstance(payload, list):
-        collected: list[Path] = []
-        for item in payload:
-            collected.extend(_collect_video_paths_from_payload(item, base_dir, visited_json_files, visited_dirs))
-        return _unique_paths(collected)
-
-    if not isinstance(payload, dict):
-        return []
-
-    for key in ("clips", "clipPaths", "clip_paths", "videos", "videoPaths", "video_paths", "files", "items", "entries", "artifacts", "segments", "segment_dirs"):
-        if key in payload:
-            collected = _collect_video_paths_from_payload(payload[key], base_dir, visited_json_files, visited_dirs)
-            if collected:
-                return _unique_paths(collected)
-
-    for key in ("clipPath", "clip_path", *getattr(helpers, "VIDEO_KEYS", ()), "payloadPath", "manifestPath", "partitionDir", "rootPath", "root_path"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            collected = _collect_video_paths_from_payload(value, base_dir, visited_json_files, visited_dirs)
-            if collected:
-                return _unique_paths(collected)
-
-    collected: list[Path] = []
-    for value in payload.values():
-        collected.extend(_collect_video_paths_from_payload(value, base_dir, visited_json_files, visited_dirs))
-    return _unique_paths(collected)
-
-
 def _resolve_platform_video_inputs(artifact: dict, hyperparams: dict) -> list[tuple[str, Path]]:
-    collected: list[Path] = []
-    visited_json_files: set[Path] = set()
-    visited_dirs: set[Path] = set()
-
-    artifact_path = artifact.get("path")
-    if isinstance(artifact_path, str) and artifact_path and not artifact_path.startswith("bos://"):
-        collected.extend(_collect_video_paths_from_path(artifact_path, None, visited_json_files, visited_dirs))
-
-    artifact_data = artifact.get("data")
-    collected.extend(_collect_video_paths_from_payload(artifact_data, None, visited_json_files, visited_dirs))
-
-    for data_ref in (artifact.get("dataRef"), artifact_data.get("dataRef") if isinstance(artifact_data, dict) else None):
-        if isinstance(data_ref, dict):
-            for key in ("payloadPath", "manifestPath", "partitionDir"):
-                value = data_ref.get(key)
-                if isinstance(value, str) and value and not value.startswith("bos://"):
-                    collected.extend(_collect_video_paths_from_path(value, None, visited_json_files, visited_dirs))
-
-    videos = _drop_parent_videos_when_child_inputs_exist(_unique_paths(collected))
+    videos = resolve_local_video_inputs(
+        artifact,
+        read_json_file=helpers._read_json_file,
+        video_keys=getattr(helpers, "VIDEO_KEYS", ()),
+        video_suffixes=VIDEO_SUFFIXES,
+        direct_video_names=getattr(helpers, "DIRECT_VIDEO_NAMES", ("rgb.mp4", "cam_head.mp4", "video.mp4")),
+    )
     if videos:
         return [("video", path) for path in videos]
 
@@ -220,7 +74,7 @@ def _build_args(kind: str, input_path: Path, output_path: Path, hyperparams: dic
         ),
         use_frame_cache=helpers._as_bool(
             _pick_runtime_value(hyperparams, "USE_FRAME_CACHE", "use_frame_cache"),
-            default=False,
+            default=True,
         ),
         frame_cache_num_workers=helpers._as_int(
             _pick_runtime_value(hyperparams, "FRAME_CACHE_NUM_WORKERS", "frame_cache_num_workers"),

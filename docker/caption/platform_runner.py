@@ -21,6 +21,7 @@ try:
     from runner import run_caption
 except ModuleNotFoundError:
     from .runner import run_caption
+from platform_input import resolve_local_video_inputs
 
 JSON_SUFFIXES = {".json"}
 VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
@@ -87,6 +88,24 @@ def _pick_runtime_value(hyperparams: dict, env_key: str, *aliases: str, default:
     for existing_key, value in hyperparams.items():
         if str(existing_key).lower() in lowered_keys and value not in (None, ""):
             return str(value).strip()
+    return default
+
+
+def _pick_hyperparam(hyperparams: dict, key: str, *, env_key: str | None = None, default: str = "") -> str:
+    """Read one canonical platform hyperparam, with one matching env fallback."""
+    value = hyperparams.get(key)
+    if value not in (None, ""):
+        return str(value).strip()
+
+    lowered_key = key.lower()
+    for existing_key, existing_value in hyperparams.items():
+        if str(existing_key).lower() == lowered_key and existing_value not in (None, ""):
+            return str(existing_value).strip()
+
+    if env_key:
+        value = os.getenv(env_key, "").strip()
+        if value:
+            return value
     return default
 
 
@@ -611,79 +630,69 @@ def _resolve_runtime_input(artifact: dict, hyperparams: dict) -> tuple[str, Path
 
 
 def _build_args(kind: str, input_path: Path, output_path: Path, hyperparams: dict) -> argparse.Namespace:
-    method = _normalize_method(_pick_runtime_value(
-        hyperparams,
-        "METHOD",
-        "method",
-        "CAPTION_METHOD",
-        "caption_method",
-        default="task",
-    ))
-    vlm_provider = _pick_runtime_value(
-        hyperparams,
-        "VLM_API_PROVIDER",
-        "vlm_api_provider",
-        default=os.getenv("VLM_API_PROVIDER", ""),
-    )
-    no_batch_value = _pick_runtime_value(
-        hyperparams,
-        "NO_BATCH",
-        "no_batch",
-    )
+    method = _normalize_method(_pick_hyperparam(hyperparams, "method", env_key="METHOD", default="task"))
+    vlm_provider = _pick_hyperparam(hyperparams, "vlm_api_provider", env_key="VLM_API_PROVIDER")
+    no_batch_value = _pick_hyperparam(hyperparams, "no_batch", env_key="NO_BATCH")
     no_batch = _as_bool(no_batch_value, default=True)
     if vlm_provider.strip().lower() == "volcengine_ark":
         no_batch = True
+    segment_granularity = _pick_hyperparam(
+        hyperparams,
+        "segment_granularity",
+        env_key="SEGMENT_GRANULARITY",
+        default="task",
+    ).lower()
 
     return argparse.Namespace(
         method=method if method in {"task", "atomic_action"} else "task",
         video=input_path if kind == "video" else None,
         episode=input_path if kind == "episode" else None,
         output=output_path,
-        preview=_as_bool(_pick_runtime_value(hyperparams, "PREVIEW", "preview"), default=False),
-        max_workers=_as_int(_pick_runtime_value(hyperparams, "MAX_WORKERS", "max_workers"), 8),
+        preview=_as_bool(_pick_hyperparam(hyperparams, "preview", env_key="PREVIEW"), default=False),
+        max_workers=_as_int(_pick_hyperparam(hyperparams, "max_workers", env_key="MAX_WORKERS"), 8),
         no_batch=no_batch,
-        window_sec=_as_float(_pick_runtime_value(hyperparams, "WINDOW_SEC", "window_sec"), 10.0),
-        step_sec=_as_float(_pick_runtime_value(hyperparams, "STEP_SEC", "step_sec"), 5.0),
-        frames_per_window=_as_int(_pick_runtime_value(hyperparams, "FRAMES_PER_WINDOW", "frames_per_window"), 12),
-        task_name=_pick_runtime_value(hyperparams, "TASK_NAME", "task_name", default=""),
-        task_window_sec=_as_float(_pick_runtime_value(hyperparams, "TASK_WINDOW_SEC", "task_window_sec"), 12.0),
-        task_step_sec=_as_float(_pick_runtime_value(hyperparams, "TASK_STEP_SEC", "task_step_sec"), 6.0),
-        task_frames_per_window=_as_int(
-            _pick_runtime_value(hyperparams, "TASK_FRAMES_PER_WINDOW", "task_frames_per_window"),
+        segment_cut=_as_bool(
+            _pick_hyperparam(hyperparams, "segment_cut", env_key="SEGMENT_CUT"),
+            default=False,
+        ),
+        segment_granularity=segment_granularity,
+        segment_output_dir=None,
+        window_sec=_as_float(_pick_hyperparam(hyperparams, "window_sec", env_key="WINDOW_SEC"), 10.0),
+        step_sec=_as_float(_pick_hyperparam(hyperparams, "step_sec", env_key="STEP_SEC"), 5.0),
+        frames_per_window=_as_int(
+            _pick_hyperparam(hyperparams, "frames_per_window", env_key="FRAMES_PER_WINDOW"),
             12,
         ),
-        action_window_sec=_as_float(_pick_runtime_value(hyperparams, "ACTION_WINDOW_SEC", "action_window_sec"), 6.0),
-        action_step_sec=_as_float(_pick_runtime_value(hyperparams, "ACTION_STEP_SEC", "action_step_sec"), 3.0),
+        task_name=_pick_hyperparam(hyperparams, "task_name", env_key="TASK_NAME"),
+        task_window_sec=_as_float(
+            _pick_hyperparam(hyperparams, "task_window_sec", env_key="TASK_WINDOW_SEC"),
+            12.0,
+        ),
+        task_step_sec=_as_float(
+            _pick_hyperparam(hyperparams, "task_step_sec", env_key="TASK_STEP_SEC"),
+            6.0,
+        ),
+        task_frames_per_window=_as_int(
+            _pick_hyperparam(hyperparams, "task_frames_per_window", env_key="TASK_FRAMES_PER_WINDOW"),
+            12,
+        ),
+        action_window_sec=_as_float(
+            _pick_hyperparam(hyperparams, "action_window_sec", env_key="ACTION_WINDOW_SEC"),
+            6.0,
+        ),
+        action_step_sec=_as_float(
+            _pick_hyperparam(hyperparams, "action_step_sec", env_key="ACTION_STEP_SEC"),
+            3.0,
+        ),
         action_frames_per_window=_as_int(
-            _pick_runtime_value(hyperparams, "ACTION_FRAMES_PER_WINDOW", "action_frames_per_window"),
+            _pick_hyperparam(hyperparams, "action_frames_per_window", env_key="ACTION_FRAMES_PER_WINDOW"),
             8,
         ),
         vlm_provider=vlm_provider,
-        vlm_api_key=_pick_runtime_value(
-            hyperparams,
-            "VLM_API_KEY",
-            "vlm_api_key",
-            default=os.getenv("VLM_API_KEY", ""),
-        ),
-        dashscope_api_key=_pick_runtime_value(
-            hyperparams,
-            "DASHSCOPE_API_KEY",
-            default=os.getenv("DASHSCOPE_API_KEY", ""),
-        ),
-        ark_api_key=_pick_runtime_value(
-            hyperparams,
-            "ARK_API_KEY",
-            default=os.getenv("ARK_API_KEY", ""),
-        ),
-        vlm_model=_pick_runtime_value(
-            hyperparams,
-            "VLM_MODEL",
-            "vlm_model",
-            "VLM_CAPTION_MODEL",
-            "vlm_caption_model",
-            "VLM_DEFAULT_MODEL",
-            default=os.getenv("VLM_MODEL", os.getenv("VLM_CAPTION_MODEL", os.getenv("VLM_DEFAULT_MODEL", ""))),
-        ),
+        vlm_api_key=_pick_hyperparam(hyperparams, "vlm_api_key", env_key="VLM_API_KEY"),
+        dashscope_api_key=_pick_hyperparam(hyperparams, "dashscope_api_key", env_key="DASHSCOPE_API_KEY"),
+        ark_api_key=_pick_hyperparam(hyperparams, "ark_api_key", env_key="ARK_API_KEY"),
+        vlm_model=_pick_hyperparam(hyperparams, "vlm_model", env_key="VLM_MODEL"),
     )
 
 
@@ -704,141 +713,14 @@ def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _unique_paths(paths: list[Path]) -> list[Path]:
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for path in paths:
-        key = str(path)
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
-
-
-def _drop_parent_videos_when_child_inputs_exist(paths: list[Path]) -> list[Path]:
-    resolved = [(path, path.resolve()) for path in paths]
-    filtered: list[Path] = []
-    for path, real_path in resolved:
-        if path.name in DIRECT_VIDEO_NAMES and any(
-            other != real_path and real_path.parent in other.parents
-            for _, other in resolved
-        ):
-            continue
-        filtered.append(path)
-    return filtered
-
-
-def _direct_video_files(directory: Path) -> list[Path]:
-    configured_name = os.getenv("EGOX_INPUT_VIDEO_PATH", "rgb.mp4")
-    for name in (configured_name, *DIRECT_VIDEO_NAMES):
-        candidate = directory / name
-        if candidate.is_file():
-            return [candidate]
-    return sorted(path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES)
-
-
-def _collect_video_paths_from_dir(
-    directory: Path,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    real_dir = directory.resolve()
-    if real_dir in visited_dirs:
-        return []
-    visited_dirs.add(real_dir)
-
-    direct_videos = _direct_video_files(real_dir)
-    if direct_videos:
-        return direct_videos
-
-    child_videos: list[Path] = []
-    for child in sorted(path for path in real_dir.iterdir() if path.is_dir() and not path.name.startswith(".")):
-        child_videos.extend(_direct_video_files(child))
-    if child_videos:
-        return _unique_paths(child_videos)
-
-    collected: list[Path] = []
-    json_candidates = sorted(path for path in real_dir.iterdir() if path.is_file() and path.suffix.lower() == ".json")
-    for child in sorted(path for path in real_dir.iterdir() if path.is_dir() and not path.name.startswith(".")):
-        json_candidates.extend(sorted(path for path in child.iterdir() if path.is_file() and path.suffix.lower() == ".json"))
-    for json_path in json_candidates[:500]:
-        collected.extend(_collect_video_paths_from_path(json_path, real_dir, visited_json_files, visited_dirs))
-    return _unique_paths(collected)
-
-
-def _collect_video_paths_from_path(
-    candidate: str | Path,
-    base_dir: Path | None,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    path = _resolve_candidate_path(candidate, base_dir)
-    if path.is_file() and path.suffix.lower() in VIDEO_SUFFIXES:
-        return [path]
-    if path.is_file() and path.suffix.lower() == ".json":
-        real_path = path.resolve()
-        if real_path in visited_json_files:
-            return []
-        visited_json_files.add(real_path)
-        return _collect_video_paths_from_payload(_read_json_file(real_path), real_path.parent, visited_json_files, visited_dirs)
-    if path.is_dir():
-        return _collect_video_paths_from_dir(path, visited_json_files, visited_dirs)
-    return []
-
-
-def _collect_video_paths_from_payload(
-    payload: object,
-    base_dir: Path | None,
-    visited_json_files: set[Path],
-    visited_dirs: set[Path],
-) -> list[Path]:
-    if isinstance(payload, str):
-        if payload.startswith("bos://"):
-            return []
-        return _collect_video_paths_from_path(payload, base_dir, visited_json_files, visited_dirs)
-    if isinstance(payload, list):
-        collected: list[Path] = []
-        for item in payload:
-            collected.extend(_collect_video_paths_from_payload(item, base_dir, visited_json_files, visited_dirs))
-        return _unique_paths(collected)
-    if not isinstance(payload, dict):
-        return []
-
-    for key in ("clips", "clipPaths", "clip_paths", "videos", "videoPaths", "video_paths", "files", "items", "entries", "artifacts", "segments", "segment_dirs"):
-        if key in payload:
-            collected = _collect_video_paths_from_payload(payload[key], base_dir, visited_json_files, visited_dirs)
-            if collected:
-                return _unique_paths(collected)
-
-    for key in ("clipPath", "clip_path", *VIDEO_KEYS, "payloadPath", "manifestPath", "partitionDir", "rootPath", "root_path"):
-        value = payload.get(key)
-        if isinstance(value, str) and value:
-            collected = _collect_video_paths_from_payload(value, base_dir, visited_json_files, visited_dirs)
-            if collected:
-                return _unique_paths(collected)
-
-    collected: list[Path] = []
-    for value in payload.values():
-        collected.extend(_collect_video_paths_from_payload(value, base_dir, visited_json_files, visited_dirs))
-    return _unique_paths(collected)
-
-
 def _resolve_platform_video_inputs(artifact: dict, hyperparams: dict) -> list[tuple[str, Path]]:
-    collected: list[Path] = []
-    visited_json_files: set[Path] = set()
-    visited_dirs: set[Path] = set()
-    artifact_path = artifact.get("path")
-    if isinstance(artifact_path, str) and artifact_path and not artifact_path.startswith("bos://"):
-        collected.extend(_collect_video_paths_from_path(artifact_path, None, visited_json_files, visited_dirs))
-    artifact_data = artifact.get("data")
-    collected.extend(_collect_video_paths_from_payload(artifact_data, None, visited_json_files, visited_dirs))
-    for data_ref in (artifact.get("dataRef"), artifact_data.get("dataRef") if isinstance(artifact_data, dict) else None):
-        if isinstance(data_ref, dict):
-            for key in ("payloadPath", "manifestPath", "partitionDir"):
-                value = data_ref.get(key)
-                if isinstance(value, str) and value and not value.startswith("bos://"):
-                    collected.extend(_collect_video_paths_from_path(value, None, visited_json_files, visited_dirs))
-    videos = _drop_parent_videos_when_child_inputs_exist(_unique_paths(collected))
+    videos = resolve_local_video_inputs(
+        artifact,
+        read_json_file=_read_json_file,
+        video_keys=VIDEO_KEYS,
+        video_suffixes=VIDEO_SUFFIXES,
+        direct_video_names=DIRECT_VIDEO_NAMES,
+    )
     if videos:
         return [("video", path) for path in videos]
     return [_resolve_runtime_input(artifact, hyperparams)]
@@ -858,6 +740,8 @@ def _log_runtime_args(args: argparse.Namespace) -> None:
         f"no_batch={args.no_batch} "
         f"max_workers={args.max_workers} "
         f"preview={args.preview} "
+        f"segment_cut={args.segment_cut} "
+        f"segment_granularity={args.segment_granularity} "
         f"vlm_provider={args.vlm_provider or '<empty>'} "
         f"vlm_model={args.vlm_model or '<empty>'}",
         file=sys.stderr,
@@ -871,6 +755,8 @@ def _runtime_args_summary(args: argparse.Namespace) -> dict:
         "noBatch": args.no_batch,
         "maxWorkers": args.max_workers,
         "preview": args.preview,
+        "segmentCut": args.segment_cut,
+        "segmentGranularity": args.segment_granularity,
         "taskName": args.task_name or None,
         "windowSec": args.window_sec,
         "stepSec": args.step_sec,
@@ -889,6 +775,7 @@ def _runtime_args_summary(args: argparse.Namespace) -> dict:
 def _caption_artifact_data(summary: dict, output_path: Path) -> dict:
     return {
         "method": summary.get("method"),
+        "instruction": summary.get("instruction"),
         "scene": summary.get("scene"),
         "numTasks": summary.get("numTasks"),
         "numActions": summary.get("numActions"),
@@ -917,11 +804,13 @@ def main() -> None:
     first_args = None
     for index, (input_kind, input_path) in enumerate(video_inputs, start=1):
         output_filename = _caption_output_name(input_path, index, len(video_inputs))
-        output_name = _pick_runtime_value(hyperparams, "OUTPUT_NAME", "output_name", default="").strip()
+        output_name = _pick_hyperparam(hyperparams, "output_name", env_key="OUTPUT_NAME").strip()
         if output_name and len(video_inputs) == 1:
             output_filename = output_name if output_name.endswith(".json") else f"{output_name}.json"
         artifact_path = output_dir / output_filename
         args = _build_args(input_kind, input_path, artifact_path, hyperparams)
+        if args.segment_cut:
+            args.segment_output_dir = output_dir / f"{artifact_path.stem}_segments"
         if index == 1:
             _log_runtime_args(args)
             first_args = args
@@ -932,6 +821,8 @@ def main() -> None:
         summary = runtime_result.get("summary") or {}
         summaries.append(_caption_artifact_data(summary, runtime_result["output_path"]))
         _write_json(runtime_result["output_path"], caption_result)
+        segment_result = runtime_result.get("segment_result")
+        segment_metrics = segment_result.metrics if segment_result is not None else {}
         output_artifacts.append({
             "name": artifact_path.name,
             "type": "json",
@@ -953,8 +844,90 @@ def main() -> None:
                 "inputCount": len(video_inputs),
                 "scene": summary.get("scene"),
                 "previewPath": str(runtime_result["preview_path"]) if runtime_result.get("preview_path") else None,
+                "segmentCut": bool(segment_result),
+                "segmentMetrics": segment_metrics or None,
             },
         })
+        if segment_result is not None:
+            manifest_path = Path(segment_metrics.get("manifest_path", ""))
+            failure_samples = [
+                {
+                    "segmentId": failure.get("segmentId"),
+                    "reason": failure.get("reason"),
+                    "message": failure.get("message"),
+                    "frameInterval": failure.get("frameInterval"),
+                }
+                for failure in segment_metrics.get("failures", [])[:3]
+                if isinstance(failure, dict)
+            ]
+            requested_segments = int(segment_metrics.get("requested_segments", 0) or 0)
+            total_segments = int(segment_metrics.get("total_segments", 0) or 0)
+            failed_segments = int(segment_metrics.get("failed_segments", 0) or 0)
+            if requested_segments and total_segments == 0:
+                segment_cut_status = "failed"
+            elif failed_segments:
+                segment_cut_status = "partial"
+            else:
+                segment_cut_status = "ok"
+            segment_video_artifacts = []
+            for segment_idx, segment_dir_value in enumerate(segment_metrics.get("segment_dirs", []), start=1):
+                segment_dir = Path(segment_dir_value)
+                segment_video_path = segment_dir / "rgb.mp4"
+                if not segment_video_path.exists():
+                    continue
+                segment_info_path = segment_dir / "segment_info.json"
+                segment_video_artifacts.append({
+                    "name": f"{artifact_path.stem}_{segment_dir.name}.mp4",
+                    "type": "video",
+                    "path": str(segment_video_path),
+                    "portId": "out-3",
+                    "portName": "segment_video",
+                    "data": {
+                        "segmentId": segment_dir.name,
+                        "videoPath": str(segment_video_path),
+                        "infoPath": str(segment_info_path) if segment_info_path.exists() else None,
+                        "manifestPath": str(manifest_path),
+                        "captionPath": str(runtime_result["output_path"]),
+                    },
+                    "metadata": {
+                        "runtimeArgs": runtime_args,
+                        "inputKind": input_kind,
+                        "inputPath": str(input_path),
+                        "inputIndex": index,
+                        "inputCount": len(video_inputs),
+                        "segmentIndex": segment_idx,
+                        "segmentCount": segment_metrics.get("total_segments", 0),
+                        "granularity": segment_metrics.get("granularity"),
+                    },
+                })
+            output_artifacts.append({
+                "name": manifest_path.name or "segments_manifest.json",
+                "type": "json",
+                "path": str(manifest_path),
+                "portId": "out-2",
+                "portName": "segments",
+                "data": {
+                    "payloadPath": str(manifest_path),
+                    "segmentsDir": str(manifest_path.parent),
+                    "status": segment_cut_status,
+                    "requestedSegments": requested_segments,
+                    "totalSegments": total_segments,
+                    "videoArtifacts": len(segment_video_artifacts),
+                    "failedSegments": failed_segments,
+                    "failureSamples": failure_samples,
+                    "granularity": segment_metrics.get("granularity"),
+                },
+                "dataRef": {"payloadPath": str(manifest_path)},
+                "metadata": {
+                    "runtimeArgs": runtime_args,
+                    "inputKind": input_kind,
+                    "inputPath": str(input_path),
+                    "inputIndex": index,
+                    "inputCount": len(video_inputs),
+                    "captionPath": str(runtime_result["output_path"]),
+                },
+            })
+            output_artifacts.extend(segment_video_artifacts)
 
     if len(video_inputs) > 1:
         aggregate_path = output_dir / "caption_manifest.json"
@@ -983,6 +956,8 @@ def main() -> None:
                     f"no_batch={first_args.no_batch if first_args else '<empty>'}, "
                     f"max_workers={first_args.max_workers if first_args else '<empty>'}, "
                     f"preview={first_args.preview if first_args else '<empty>'}, "
+                    f"segment_cut={first_args.segment_cut if first_args else '<empty>'}, "
+                    f"segment_granularity={first_args.segment_granularity if first_args else '<empty>'}, "
                     f"vlm_provider={(first_args.vlm_provider or '<empty>') if first_args else '<empty>'}, "
                     f"vlm_model={(first_args.vlm_model or '<empty>') if first_args else '<empty>'}, "
                     f"input_count={len(video_inputs)}"
